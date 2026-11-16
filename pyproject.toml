@@ -33,7 +33,7 @@ dev = ["pre-commit", "pytest", "pytest-cov", "ruff"]
 colmap = [
     "lightglue @ git+https://github.com/cvg/LightGlue.git",
     "open3d",
-    "pycolmap==3.10.0"
+    "pycolmap>=3.10.0"
 ]
 gradio = ["gradio==5.47.2", "spaces"]
 radio = ["timm"]
@@ -72,8 +72,8 @@ all = [
 # Tool uv configuration to restrict environment resolution to supported platforms and Python versions
 [tool.uv]
 environments = [
-    "sys_platform == 'linux' and python_version >= '3.11' and python_version < '3.13'",
-    "sys_platform == 'win32' and python_version >= '3.11' and python_version < '3.13'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64' and python_version == '3.11'",
 ]
 
 # Setuptools configuration
