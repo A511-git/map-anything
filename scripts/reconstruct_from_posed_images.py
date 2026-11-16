@@ -749,6 +749,12 @@ def main():
         help="Mixed precision floating point type ('auto', 'fp16', 'bf16', 'fp32'). 'auto' uses FP16 on SM75 (Turing/T4) / SM70 (Volta) and BF16 on SM80+ (Ampere).",
     )
     parser.add_argument(
+        "--minibatch_size",
+        type=int,
+        default=1,
+        help="Minibatch size for memory-efficient dense prediction heads (default: 1)",
+    )
+    parser.add_argument(
         "--chunk_size",
         type=int,
         default=None,
