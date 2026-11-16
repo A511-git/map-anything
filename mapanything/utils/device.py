@@ -128,7 +128,13 @@ def get_device_capabilities(device):
     }
 
     if device_type == "cuda":
-        capabilities["bf16_supported"] = torch.cuda.is_bf16_supported()
+        # Native hardware acceleration for BF16 Tensor Cores requires Compute Capability >= 8.0 (Ampere or newer).
+        # SM 7.5 (Turing / Tesla T4) and SM 7.0 (Volta / V100) do NOT have BF16 Tensor Cores and must fall back to FP16.
+        try:
+            major, _ = torch.cuda.get_device_capability(device)
+            capabilities["bf16_supported"] = (major >= 8) and torch.cuda.is_bf16_supported()
+        except Exception:
+            capabilities["bf16_supported"] = torch.cuda.is_bf16_supported()
     elif device_type == "mps":
         capabilities["bf16_supported"] = False
     else:

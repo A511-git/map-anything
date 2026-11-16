@@ -399,6 +399,8 @@ def reconstruct_from_posed_images(
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
+    amp_dtype: str = "auto",
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -517,24 +519,85 @@ def reconstruct_from_posed_images(
     model.eval()
 
     # 7. Run inference
+    # Determine AMP dtype with automatic SM75 (Turing / T4) fallback to FP16
+    resolved_amp_dtype = amp_dtype
+    if resolved_amp_dtype == "auto" or resolved_amp_dtype is None:
+        if torch.cuda.is_available():
+            try:
+                major, _ = torch.cuda.get_device_capability(device)
+                if major >= 8 and torch.cuda.is_bf16_supported():
+                    resolved_amp_dtype = "bf16"
+                else:
+                    resolved_amp_dtype = "fp16"  # SM75 (T4) / SM70 (V100) have FP16 Tensor Cores, not BF16
+            except Exception:
+                resolved_amp_dtype = "fp16"
+        else:
+            resolved_amp_dtype = "fp32"
+
     if verbose:
-        print("Running feed-forward multi-modal inference with input camera poses...")
-    outputs = model.infer(
-        processed_views,
-        memory_efficient_inference=True,
-        minibatch_size=minibatch_size,
-        use_amp=True,
-        amp_dtype="bf16",
-        apply_mask=apply_mask,
-        mask_edges=mask_edges,
-        use_multiview_confidence=use_multiview_confidence,
-        apply_confidence_mask=apply_confidence_mask,
-        confidence_percentile=confidence_percentile,
-        ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
-        ignore_depth_inputs=True,
-        ignore_pose_inputs=False,  # Fuse input poses in latent space
-        ignore_pose_scale_inputs=not is_metric_scale,
-    )
+        print(f"Mixed precision configured: AMP={resolved_amp_dtype.upper()} (hardware-matched).")
+
+    # Auto-detect safe chunk size if not explicitly set and running on limited GPU memory
+    effective_chunk_size = chunk_size
+    if effective_chunk_size is None and len(processed_views) > 6 and torch.cuda.is_available():
+        try:
+            total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if total_mem_gb <= 16.5:
+                effective_chunk_size = 4
+                if verbose:
+                    print(f"Auto-selected chunk_size={effective_chunk_size} (detected {total_mem_gb:.1f} GB GPU memory and {len(processed_views)} views) to prevent CUDA OOM.")
+        except Exception:
+            pass
+
+    if effective_chunk_size is not None and effective_chunk_size > 0 and effective_chunk_size < len(processed_views):
+        if verbose:
+            print(f"Running chunked multi-modal inference ({effective_chunk_size} views/chunk across {len(processed_views)} total views)...")
+        outputs = []
+        num_chunks = (len(processed_views) + effective_chunk_size - 1) // effective_chunk_size
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * effective_chunk_size
+            end = min(start + effective_chunk_size, len(processed_views))
+            chunk_views = processed_views[start:end]
+            if verbose:
+                print(f"  Chunk {chunk_idx + 1}/{num_chunks}: views [{start}..{end - 1}] ({len(chunk_views)} views)...")
+            chunk_outputs = model.infer(
+                chunk_views,
+                memory_efficient_inference=True,
+                minibatch_size=minibatch_size,
+                use_amp=True,
+                amp_dtype=resolved_amp_dtype,
+                apply_mask=apply_mask,
+                mask_edges=mask_edges,
+                use_multiview_confidence=use_multiview_confidence,
+                apply_confidence_mask=apply_confidence_mask,
+                confidence_percentile=confidence_percentile,
+                ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
+                ignore_depth_inputs=True,
+                ignore_pose_inputs=False,  # Fuse input poses in latent space
+                ignore_pose_scale_inputs=not is_metric_scale,
+            )
+            outputs.extend(chunk_outputs)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        if verbose:
+            print("Running feed-forward multi-modal inference with input camera poses...")
+        outputs = model.infer(
+            processed_views,
+            memory_efficient_inference=True,
+            minibatch_size=minibatch_size,
+            use_amp=True,
+            amp_dtype=resolved_amp_dtype,
+            apply_mask=apply_mask,
+            mask_edges=mask_edges,
+            use_multiview_confidence=use_multiview_confidence,
+            apply_confidence_mask=apply_confidence_mask,
+            confidence_percentile=confidence_percentile,
+            ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
+            ignore_depth_inputs=True,
+            ignore_pose_inputs=False,  # Fuse input poses in latent space
+            ignore_pose_scale_inputs=not is_metric_scale,
+        )
 
     if verbose:
         print("Inference completed! Unprojecting and assembling point clouds...")
@@ -679,6 +742,19 @@ def main():
         help="Percentile for confidence masking if enabled (default: 10.0)",
     )
     parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32"],
+        help="Mixed precision floating point type ('auto', 'fp16', 'bf16', 'fp32'). 'auto' uses FP16 on SM75 (Turing/T4) / SM70 (Volta) and BF16 on SM80+ (Ampere).",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=None,
+        help="Max number of views to process per GPU forward pass to prevent CUDA OOM (e.g. 4 or 6). Defaults to auto-detect (4 on <=16GB GPUs).",
+    )
+    parser.add_argument(
         "--apache",
         action="store_true",
         help="Use Apache 2.0 licensed model checkpoint (facebook/map-anything-apache)",
@@ -715,6 +791,9 @@ def main():
         use_multiview_confidence=args.use_multiview_confidence,
         apply_confidence_mask=args.apply_confidence_mask,
         confidence_percentile=args.confidence_percentile,
+        minibatch_size=args.minibatch_size,
+        chunk_size=args.chunk_size,
+        amp_dtype=args.amp_dtype,
     )
 
 
