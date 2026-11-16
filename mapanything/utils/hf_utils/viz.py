@@ -11,8 +11,12 @@ import copy
 import os
 from typing import Tuple
 
+if "matplotlib_inline" in os.environ.get("MPLBACKEND", ""):
+    os.environ["MPLBACKEND"] = "Agg"
+
 import cv2
 import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import requests
 import trimesh

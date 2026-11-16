@@ -28,8 +28,17 @@ Output structure:
 import argparse
 import glob
 import os
+import sys
+from pathlib import Path
+
+# Ensure repo root is on sys.path
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+if "matplotlib_inline" in os.environ.get("MPLBACKEND", ""):
+    os.environ["MPLBACKEND"] = "Agg"
 
 import numpy as np
 import torch
