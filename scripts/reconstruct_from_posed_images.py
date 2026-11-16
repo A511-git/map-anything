@@ -151,6 +151,7 @@ def load_poses(
     poses_path: str,
     num_expected: Optional[int] = None,
     pose_convention: str = "opencv",
+    image_filenames: Optional[List[str]] = None,
 ) -> List[np.ndarray]:
     """
     Load camera poses from various file formats (.npy, .npz, .json, or folder of matrices).
@@ -160,6 +161,7 @@ def load_poses(
         poses_path: Path to pose file or directory
         num_expected: Expected number of poses (optional)
         pose_convention: Source pose convention ('opencv', 'opengl', 'blender', 'colmap_w2c')
+        image_filenames: List of image basenames to match poses by filename if available (optional)
 
     Returns:
         List of 4x4 numpy arrays in OpenCV cam2world format
@@ -191,10 +193,47 @@ def load_poses(
             with open(path, "r", encoding="utf-8") as f:
                 content = json.load(f)
             if isinstance(content, list):
-                poses = [np.array(m, dtype=np.float32) for m in content]
+                if len(content) > 0 and isinstance(content[0], dict):
+                    name_to_pose = {}
+                    for item in content:
+                        name = item.get("image_name", "")
+                        if "cam2world_pose_4x4" in item:
+                            mat = np.array(item["cam2world_pose_4x4"], dtype=np.float32)
+                        elif "extrinsic_matrix_3x4" in item:
+                            m34 = np.array(item["extrinsic_matrix_3x4"], dtype=np.float32)
+                            mat = np.eye(4, dtype=np.float32)
+                            mat[:3, :4] = m34
+                        elif "pose" in item:
+                            mat = np.array(item["pose"], dtype=np.float32)
+                        else:
+                            mat = np.array(item, dtype=np.float32)
+                        if name:
+                            name_to_pose[name] = mat
+                            name_to_pose[Path(name).name] = mat
+                    if image_filenames and any(f in name_to_pose for f in image_filenames):
+                        poses = [name_to_pose[f] for f in image_filenames if f in name_to_pose]
+                    else:
+                        poses = list(name_to_pose.values()) if name_to_pose else [np.array(m, dtype=np.float32) for m in content]
+                else:
+                    poses = [np.array(m, dtype=np.float32) for m in content]
             elif isinstance(content, dict):
                 # Dict mapping image filename to 4x4 pose list
-                poses = [np.array(v, dtype=np.float32) for v in content.values()]
+                name_to_pose = {}
+                for k, v in content.items():
+                    if isinstance(v, dict) and "cam2world_pose_4x4" in v:
+                        mat = np.array(v["cam2world_pose_4x4"], dtype=np.float32)
+                    elif isinstance(v, dict) and "extrinsic_matrix_3x4" in v:
+                        m34 = np.array(v["extrinsic_matrix_3x4"], dtype=np.float32)
+                        mat = np.eye(4, dtype=np.float32)
+                        mat[:3, :4] = m34
+                    else:
+                        mat = np.array(v, dtype=np.float32)
+                    name_to_pose[k] = mat
+                    name_to_pose[Path(k).name] = mat
+                if image_filenames and any(f in name_to_pose for f in image_filenames):
+                    poses = [name_to_pose[f] for f in image_filenames if f in name_to_pose]
+                else:
+                    poses = list(name_to_pose.values())
             else:
                 raise ValueError(f"Unsupported JSON pose format in: {poses_path}")
 
@@ -452,7 +491,12 @@ def reconstruct_from_posed_images(
 
     # 2. Load and validate camera poses
     if isinstance(poses, (str, Path)):
-        loaded_poses = load_poses(str(poses), num_expected=num_views, pose_convention=pose_convention)
+        loaded_poses = load_poses(
+            str(poses),
+            num_expected=num_views,
+            pose_convention=pose_convention,
+            image_filenames=image_filenames,
+        )
     elif isinstance(poses, np.ndarray):
         if poses.ndim == 3 and poses.shape[1:] == (4, 4):
             loaded_poses = [convert_pose_convention(poses[i], pose_convention) for i in range(poses.shape[0])]
