@@ -31,6 +31,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+# Ensure mapanything and scripts are discoverable on PYTHONPATH
+repo_root = Path(__file__).resolve().parent.parent
+scripts_dir = Path(__file__).resolve().parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
 import cv2
 import numpy as np
 
@@ -705,7 +713,10 @@ def main():
     )
 
     if args.run_reconstruction:
-        from scripts.reconstruct_from_posed_images import reconstruct_from_posed_images
+        try:
+            from scripts.reconstruct_from_posed_images import reconstruct_from_posed_images
+        except ModuleNotFoundError:
+            from reconstruct_from_posed_images import reconstruct_from_posed_images
 
         recon_out = args.recon_output
         if recon_out is None:

@@ -42,10 +42,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-# Ensure mapanything is discoverable on PYTHONPATH
+# Ensure mapanything and scripts are discoverable on PYTHONPATH
 repo_root = Path(__file__).resolve().parent.parent
+scripts_dir = Path(__file__).resolve().parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
 
 import numpy as np
 import torch
@@ -530,7 +533,10 @@ def reconstruct_from_posed_images(
         folder_candidate = Path(images if isinstance(images, (str, Path)) else images[0])
         if folder_candidate.is_dir():
             # Check 1: Does the folder contain raw ARKit panoramas (*.jpg + *.json)?
-            from scripts.process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
+            try:
+                from scripts.process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
+            except ModuleNotFoundError:
+                from process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
 
             if is_arkit_pano_directory(folder_candidate):
                 if verbose:
