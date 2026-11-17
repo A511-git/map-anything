@@ -321,6 +321,66 @@ def load_intrinsics(
     return None
 
 
+def resolve_output_pointcloud_path(
+    output_spec: Optional[Union[str, Path]],
+    images_input: Union[str, Path, List[Union[str, Path]]],
+    default_filename: str = "pointcloud.ply",
+) -> Tuple[Optional[str], Optional[Path]]:
+    """
+    Resolve final point cloud file path and target folder.
+    
+    If output_spec is a directory (e.g. 'kaggle/working/output'), nests the input
+    folder name into it:
+        'kaggle/working/output' + 'AR_KIT' -> 'kaggle/working/output/AR_KIT/pointcloud.ply'
+        
+    If output_spec is a file path (e.g. 'output/reconstruction.ply'):
+        'output' + 'AR_KIT' -> 'output/AR_KIT/reconstruction.ply'
+        
+    Returns:
+        (resolved_file_path_str, resolved_folder_path)
+    """
+    if output_spec is None:
+        return None, None
+
+    # Determine input folder name
+    if isinstance(images_input, (str, Path)):
+        inp_path = Path(images_input)
+        if inp_path.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+            folder_name = inp_path.parent.name
+        else:
+            folder_name = inp_path.name
+    elif isinstance(images_input, list) and len(images_input) > 0:
+        first_p = Path(images_input[0])
+        if first_p.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+            folder_name = first_p.parent.name
+        else:
+            folder_name = first_p.name
+    else:
+        folder_name = "reconstruction"
+
+    if not folder_name:
+        folder_name = "reconstruction"
+
+    out_p = Path(output_spec)
+
+    if out_p.suffix.lower() in [".ply", ".pcd"]:
+        fname = out_p.name
+        parent_dir = out_p.parent
+        if parent_dir.name == folder_name:
+            target_dir = parent_dir
+        else:
+            target_dir = parent_dir / folder_name
+        final_file = target_dir / fname
+    else:
+        if out_p.name == folder_name:
+            target_dir = out_p
+        else:
+            target_dir = out_p / folder_name
+        final_file = target_dir / default_filename
+
+    return str(final_file), target_dir
+
+
 def export_point_cloud(
     output_path: str,
     points: np.ndarray,
@@ -421,7 +481,7 @@ def export_point_cloud(
 
 def reconstruct_from_posed_images(
     images: Union[str, Path, List[Union[str, Path, np.ndarray, Image.Image]]],
-    poses: Union[str, Path, List[np.ndarray], np.ndarray],
+    poses: Optional[Union[str, Path, List[np.ndarray], np.ndarray]] = None,
     intrinsics: Optional[Union[str, Path, List[np.ndarray], np.ndarray]] = None,
     pose_convention: str = "opencv",
     is_metric_scale: bool = True,
@@ -441,35 +501,89 @@ def reconstruct_from_posed_images(
     chunk_size: Optional[int] = None,
     amp_dtype: str = "auto",
     verbose: bool = True,
+    # Pano processing options:
+    split_mode: str = "ring12",
+    face_size: int = 1024,
+    fov_deg: float = 90.0,
+    anchor: Union[int, str] = 0,
+    heading_mode: str = "relative",
+    cache_dir: Optional[Union[str, Path]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run MapAnything inference using input images and their known camera poses,
     and return/export a combined metric 3D point cloud.
 
-    Args:
-        images: Folder containing images, or list of image paths/arrays/PIL images
-        poses: Array (N, 4, 4), list of matrices, or path to pose file
-        intrinsics: Optional (N, 3, 3) intrinsics, list of matrices, or path to intrinsics file
-        pose_convention: Source pose convention ('opencv', 'opengl', 'blender', 'colmap_w2c')
-        is_metric_scale: Whether camera poses represent true metric scale in meters
-        use_exact_input_poses: Use exact input poses for depth unprojection (zero neural regression drift)
-        model: Pre-loaded MapAnything model instance (optional)
-        model_name: Checkpoint name if model is None
-        device: Device ('cuda', 'cpu', or auto-detect)
-        output_path: Path to export .ply or .pcd
-        voxel_size: Optional voxel grid downsample size in meters (e.g. 0.005)
-        max_depth: Optional maximum depth in meters to filter out sky/infinity points (e.g. 30.0)
-        apply_mask: Apply non-ambiguous validity mask
-        mask_edges: Filter boundary edge artifacts using normals and depth
-        use_multiview_confidence: Compute geometric multi-view depth consistency confidence
-        apply_confidence_mask: Filter bottom confidence percentile
-        confidence_percentile: Percentile threshold for confidence mask
-        minibatch_size: Minibatch size for memory-efficient dense heads
-        verbose: Print progress logs
-
-    Returns:
-        Tuple of (combined_points_xyz, combined_colors_rgb)
+    Supports:
+    - Auto-detecting raw ARKit equirectangular panoramas and auto-splitting them into perspective views
+    - Auto-detecting poses.npy / poses.json and intrinsics.npy inside the input image folder
+    - Exact metric cam2world camera poses in OpenCV RDF format
     """
+    # 0. Resolve smart output path (e.g. kaggle/working/output/AR_KIT/pointcloud.ply)
+    resolved_output_path, target_output_dir = resolve_output_pointcloud_path(
+        output_path, images, default_filename="pointcloud.ply"
+    )
+    if verbose and resolved_output_path is not None:
+        print(f"[Output] Target reconstruction path: {resolved_output_path}")
+
+    # 0.1. Auto-detection & routing for raw ARKit panoramas or pre-existing poses
+    if poses is None and (isinstance(images, (str, Path)) or (isinstance(images, list) and len(images) == 1)):
+        folder_candidate = Path(images if isinstance(images, (str, Path)) else images[0])
+        if folder_candidate.is_dir():
+            # Check 1: Does the folder contain raw ARKit panoramas (*.jpg + *.json)?
+            from scripts.process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
+
+            if is_arkit_pano_directory(folder_candidate):
+                if verbose:
+                    print(f"\n[Auto-Route] Detected raw ARKit panoramas in: {folder_candidate}")
+                    print(f"[Auto-Route] Splitting panoramas into '{split_mode}' perspective views (FoV: {fov_deg}°) with anchor: {anchor}...")
+
+                if cache_dir is not None:
+                    proc_out_dir = Path(cache_dir)
+                elif target_output_dir is not None:
+                    proc_out_dir = target_output_dir
+                else:
+                    proc_out_dir = Path("output") / folder_candidate.name
+
+                res = process_arkit_panoramas(
+                    input_dir=folder_candidate,
+                    output_dir=proc_out_dir,
+                    split_mode=split_mode,
+                    face_size=face_size,
+                    fov_deg=fov_deg,
+                    heading_mode=heading_mode,
+                    anchor=anchor,
+                    verbose=verbose,
+                )
+                images = res["images_dir"]
+                poses = res["poses_npy"]
+                if intrinsics is None:
+                    intrinsics = res["intrinsics_npy"]
+
+            # Check 2: Does the folder already contain poses.npy or poses.json?
+            elif (folder_candidate / "poses.npy").is_file():
+                poses = str(folder_candidate / "poses.npy")
+                if verbose:
+                    print(f"[Auto-Route] Auto-detected poses array: {poses}")
+                if intrinsics is None and (folder_candidate / "intrinsics.npy").is_file():
+                    intrinsics = str(folder_candidate / "intrinsics.npy")
+            elif (folder_candidate / "poses.json").is_file():
+                poses = str(folder_candidate / "poses.json")
+                if verbose:
+                    print(f"[Auto-Route] Auto-detected poses JSON: {poses}")
+            elif (folder_candidate / "cubemap_poses.json").is_file():
+                poses = str(folder_candidate / "cubemap_poses.json")
+                if verbose:
+                    print(f"[Auto-Route] Auto-detected cubemap poses JSON: {poses}")
+            else:
+                raise ValueError(
+                    f"No --poses provided, and could not find poses.npy, poses.json, or ARKit panorama pairs in: {folder_candidate}"
+                )
+
+    if poses is None:
+        raise ValueError(
+            "Camera poses must be provided via --poses, or auto-detected in the --images directory."
+        )
+
     # 1. Discover and naturally sort images
     if isinstance(images, (str, Path)) or (isinstance(images, list) and len(images) > 0 and isinstance(images[0], (str, Path))):
         image_paths, image_filenames = find_images(images)
@@ -692,9 +806,9 @@ def reconstruct_from_posed_images(
         print(f"Total points assembled across {num_views} views: {len(combined_points):,}")
 
     # 9. Export if output path is requested
-    if output_path is not None:
+    if resolved_output_path is not None:
         export_point_cloud(
-            output_path=output_path,
+            output_path=resolved_output_path,
             points=combined_points,
             colors=combined_colors,
             voxel_size=voxel_size,
@@ -716,14 +830,52 @@ def main():
     parser.add_argument(
         "--poses",
         type=str,
-        required=True,
-        help="Path to pose file (.npy, .npz, .json, .txt) or directory containing per-view pose files",
+        default=None,
+        help="Path to pose file (.npy, .npz, .json, .txt) or directory containing per-view pose files. If omitted, auto-detected from --images folder.",
     )
     parser.add_argument(
         "--intrinsics",
         type=str,
         default=None,
         help="Optional path to intrinsics file (.npy, .json). Recommended for planar, non-distorted geometry.",
+    )
+    parser.add_argument(
+        "--split_mode",
+        type=str,
+        default="ring12",
+        choices=["cubemap", "ring12", "ring24", "ring8"],
+        help="If --images contains raw panos, perspective view splitting mode: 'cubemap' (6 faces), 'ring12' (14 views), or 'ring24' (26 views).",
+    )
+    parser.add_argument(
+        "--face_size",
+        type=int,
+        default=1024,
+        help="If --images contains raw panos, pixel resolution of extracted perspective faces (default: 1024).",
+    )
+    parser.add_argument(
+        "--fov",
+        type=float,
+        default=100.0,
+        help="If --images contains raw panos, field of view in degrees (default: 100.0 for overlapping cubemap faces).",
+    )
+    parser.add_argument(
+        "--anchor",
+        type=str,
+        default="0",
+        help="If --images contains raw panos, anchor panorama index or filename (default: 0).",
+    )
+    parser.add_argument(
+        "--heading_mode",
+        type=str,
+        default="relative",
+        choices=["relative", "north_aligned", "raw_compass"],
+        help="If --images contains raw panos, heading alignment mode (default: 'relative').",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Directory to save generated perspective views when auto-processing panos (default: output/processed_views/<name>).",
     )
     parser.add_argument(
         "--pose_convention",
@@ -735,8 +887,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="output/combined_pointcloud.ply",
-        help="Output path for the combined point cloud (.ply or .pcd)",
+        default="output",
+        help="Output directory (e.g. 'kaggle/working/output') or file path (.ply / .pcd). If a folder is passed, pointcloud is saved to <output>/<input_folder>/pointcloud.ply.",
     )
     parser.add_argument(
         "--is_metric",
@@ -844,6 +996,12 @@ def main():
         minibatch_size=args.minibatch_size,
         chunk_size=args.chunk_size,
         amp_dtype=args.amp_dtype,
+        split_mode=args.split_mode,
+        face_size=args.face_size,
+        fov_deg=args.fov,
+        anchor=args.anchor,
+        heading_mode=args.heading_mode,
+        cache_dir=args.cache_dir,
     )
 
 
