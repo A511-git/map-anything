@@ -873,9 +873,9 @@ def main():
     parser.add_argument(
         "--heading_mode",
         type=str,
-        default="relative",
-        choices=["relative", "north_aligned", "raw_compass"],
-        help="If --images contains raw panos, heading alignment mode (default: 'relative').",
+        default="north_aligned",
+        choices=["north_aligned", "relative", "raw_compass"],
+        help="If --images contains raw panos, heading alignment mode (default: 'north_aligned').",
     )
     parser.add_argument(
         "--cache_dir",

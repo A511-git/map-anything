@@ -73,9 +73,9 @@ def main():
     parser.add_argument(
         "--heading_mode",
         type=str,
-        default="relative",
-        choices=["relative", "north_aligned", "raw_compass"],
-        help="Heading alignment mode: 'relative' (default), 'north_aligned', or 'raw_compass'.",
+        default="north_aligned",
+        choices=["north_aligned", "relative", "raw_compass"],
+        help="Heading alignment mode: 'north_aligned' (default), 'relative', or 'raw_compass'.",
     )
     parser.add_argument(
         "--run_reconstruction",

@@ -222,7 +222,7 @@ def resolve_anchor_index(anchor_spec: Union[int, str, None], pano_records: List[
 
 def compute_level1_normalized_poses(
     pano_records: List[dict],
-    heading_mode: str = "relative",
+    heading_mode: str = "north_aligned",
     anchor_index: int = 0,
 ) -> List[dict]:
     """
@@ -233,7 +233,8 @@ def compute_level1_normalized_poses(
     
     Args:
         pano_records: List of dicts with 'image_path', 'json_path', 'origin_arkit', 'magnetic_heading_deg'
-        heading_mode: 'relative' (default), 'north_aligned', or 'raw_compass'
+        heading_mode: 'north_aligned' (default, panoramas already stitched facing north),
+                      'relative' (applies magneticHeading difference), or 'raw_compass'
         anchor_index: Index of the anchor panorama (default: 0)
     
     Returns:
@@ -426,7 +427,7 @@ def process_arkit_panoramas(
     split_mode: str = "ring12",
     face_size: int = 1024,
     fov_deg: float = 90.0,
-    heading_mode: str = "relative",
+    heading_mode: str = "north_aligned",
     anchor: Union[int, str] = 0,
     jpeg_quality: int = 95,
     verbose: bool = True,
@@ -678,9 +679,9 @@ def main():
     parser.add_argument(
         "--heading_mode",
         type=str,
-        default="relative",
-        choices=["relative", "north_aligned", "raw_compass"],
-        help="Heading alignment mode: 'relative' (default), 'north_aligned', or 'raw_compass'.",
+        default="north_aligned",
+        choices=["north_aligned", "relative", "raw_compass"],
+        help="Heading alignment mode: 'north_aligned' (default: panos already stitched yaw0=North), 'relative' (delta magnetic heading), or 'raw_compass'.",
     )
     parser.add_argument(
         "--run_reconstruction",
