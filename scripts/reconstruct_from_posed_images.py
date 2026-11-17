@@ -384,11 +384,107 @@ def resolve_output_pointcloud_path(
     return str(final_file), target_dir
 
 
+def generate_camera_markers(
+    poses: List[np.ndarray],
+    radius: float = 0.25,
+    sphere_radius: float = 0.06,
+    num_ring_points: int = 72,
+    num_sphere_points: int = 150,
+    ray_length: float = 0.45,
+    color_palette: Optional[List[Tuple[int, int, int]]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate 3D point cloud markers for cameras:
+    - A colored solid sphere at each optical center
+    - A circular ring around each camera in the horizontal plane (radius in meters)
+    - Forward-pointing sight rays along each camera's +Z optical axis
+    
+    Returns:
+        (marker_points, marker_colors) as np.ndarray
+    """
+    if color_palette is None:
+        color_palette = [
+            (255, 0, 128),   # Bright Magenta/Pink
+            (0, 255, 255),   # Bright Cyan
+            (255, 220, 0),   # Bright Gold/Yellow
+            (0, 255, 128),   # Bright Emerald Green
+            (255, 128, 0),   # Bright Orange
+            (180, 0, 255),   # Bright Purple
+        ]
+
+    marker_pts = []
+    marker_rgb = []
+
+    # Cluster/group poses by camera center (optical center)
+    centers = []
+    center_to_views = {}
+    for idx, p in enumerate(poses):
+        c = p[:3, 3]
+        matched_c_idx = None
+        for c_idx, existing_c in enumerate(centers):
+            if np.linalg.norm(c - existing_c) < 0.01:
+                matched_c_idx = c_idx
+                break
+        if matched_c_idx is None:
+            matched_c_idx = len(centers)
+            centers.append(c)
+            center_to_views[matched_c_idx] = []
+        center_to_views[matched_c_idx].append(idx)
+
+    # For each unique camera center (e.g. each parent pano location):
+    for c_idx, c in enumerate(centers):
+        color = color_palette[c_idx % len(color_palette)]
+
+        # 1. Solid sphere at optical center (Fibonacci sphere)
+        phi = np.pi * (np.sqrt(5.0) - 1.0)  # golden angle
+        sphere_pts = []
+        for i in range(num_sphere_points):
+            y = 1.0 - (i / float(max(1, num_sphere_points - 1))) * 2.0
+            r_y = np.sqrt(max(0.0, 1.0 - y * y))
+            theta = phi * i
+            x = np.cos(theta) * r_y
+            z = np.sin(theta) * r_y
+            for s in [0.4, 0.7, 1.0]:
+                sphere_pts.append(c + s * sphere_radius * np.array([x, y, z], dtype=np.float32))
+
+        sphere_pts = np.array(sphere_pts, dtype=np.float32)
+        marker_pts.append(sphere_pts)
+        marker_rgb.append(np.tile(color, (len(sphere_pts), 1)).astype(np.uint8))
+
+        # 2. Horizontal circular ring in XZ plane around camera center
+        angles = np.linspace(0, 2 * np.pi, num_ring_points, endpoint=False)
+        ring_pts = []
+        for a in angles:
+            ring_pts.append(c + np.array([radius * np.cos(a), 0.0, radius * np.sin(a)], dtype=np.float32))
+        ring_pts = np.array(ring_pts, dtype=np.float32)
+        marker_pts.append(ring_pts)
+        marker_rgb.append(np.tile(color, (len(ring_pts), 1)).astype(np.uint8))
+
+        # 3. Sight rays for each view originating at this center
+        for view_idx in center_to_views[c_idx]:
+            R = poses[view_idx][:3, :3]
+            forward_dir = R[:, 2]  # +Z forward in OpenCV RDF
+            num_ray_steps = 25
+            ray_pts = []
+            for s in np.linspace(sphere_radius, ray_length, num_ray_steps):
+                ray_pts.append(c + s * forward_dir)
+            ray_pts = np.array(ray_pts, dtype=np.float32)
+            marker_pts.append(ray_pts)
+            ray_color = np.clip(np.array(color, dtype=np.float32) * 1.2, 0, 255).astype(np.uint8)
+            marker_rgb.append(np.tile(ray_color, (len(ray_pts), 1)).astype(np.uint8))
+
+    if not marker_pts:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    return np.concatenate(marker_pts, axis=0), np.concatenate(marker_rgb, axis=0)
+
+
 def export_point_cloud(
     output_path: str,
     points: np.ndarray,
     colors: np.ndarray,
     voxel_size: Optional[float] = None,
+    camera_markers: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> None:
     """
     Save point cloud to .ply or .pcd format with optional voxel downsampling.
@@ -423,6 +519,14 @@ def export_point_cloud(
             points = points[unique_indices]
             colors = colors[unique_indices]
             print(f"NumPy voxel grid reduced point count to {len(points):,} points.")
+
+    # Append camera position markers (circles, spheres, sight rays) after downsampling
+    if camera_markers is not None:
+        marker_pts, marker_colors = camera_markers
+        if len(marker_pts) > 0:
+            points = np.concatenate([points, marker_pts], axis=0)
+            colors = np.concatenate([colors, marker_colors], axis=0)
+            print(f"Appended {len(marker_pts):,} camera marker points (spheres + rings) to output point cloud.")
 
     ext = Path(output_path).suffix.lower()
 
@@ -509,8 +613,11 @@ def reconstruct_from_posed_images(
     face_size: int = 1024,
     fov_deg: float = 90.0,
     anchor: Union[int, str] = 0,
-    heading_mode: str = "relative",
+    heading_mode: str = "north_aligned",
     cache_dir: Optional[Union[str, Path]] = None,
+    # Camera visualization options:
+    add_camera_markers: bool = True,
+    marker_radius: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run MapAnything inference using input images and their known camera poses,
@@ -813,11 +920,25 @@ def reconstruct_from_posed_images(
 
     # 9. Export if output path is requested
     if resolved_output_path is not None:
+        camera_markers_tuple = None
+        if add_camera_markers and loaded_poses:
+            marker_poses = loaded_poses
+            if not use_exact_input_poses and outputs and "camera_poses" in outputs[0]:
+                try:
+                    marker_poses = [p["camera_poses"][0].cpu().numpy() for p in outputs]
+                except Exception:
+                    marker_poses = loaded_poses
+            cam_marker_pts, cam_marker_rgb = generate_camera_markers(
+                marker_poses, radius=marker_radius
+            )
+            camera_markers_tuple = (cam_marker_pts, cam_marker_rgb)
+
         export_point_cloud(
             output_path=resolved_output_path,
             points=combined_points,
             colors=combined_colors,
             voxel_size=voxel_size,
+            camera_markers=camera_markers_tuple,
         )
 
     return combined_points, combined_colors
@@ -973,6 +1094,24 @@ def main():
         default=None,
         help="Inference device ('cuda', 'cpu', or auto-detect)",
     )
+    parser.add_argument(
+        "--add_camera_markers",
+        action="store_true",
+        default=True,
+        help="Embed 3D camera position spheres and rings into the output PLY (default: True).",
+    )
+    parser.add_argument(
+        "--no_camera_markers",
+        dest="add_camera_markers",
+        action="store_false",
+        help="Do not embed camera markers in the output point cloud.",
+    )
+    parser.add_argument(
+        "--marker_radius",
+        type=float,
+        default=0.25,
+        help="Radius of camera circle markers in meters (default: 0.25m).",
+    )
 
     args = parser.parse_args()
 
@@ -1008,6 +1147,8 @@ def main():
         anchor=args.anchor,
         heading_mode=args.heading_mode,
         cache_dir=args.cache_dir,
+        add_camera_markers=args.add_camera_markers,
+        marker_radius=args.marker_radius,
     )
 
 
