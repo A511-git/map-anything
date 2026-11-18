@@ -46,6 +46,21 @@ import numpy as np
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 
 
+class ARKitCaptureRecord(dict):
+    """
+    Metadata dictionary representing a single ARKit capture record.
+    Provides a .name property and .file_path attribute so it behaves
+    consistently alongside Path objects in logging and exports.
+    """
+    def __init__(self, data: dict, file_path: Optional[Path] = None):
+        super().__init__(data)
+        self.file_path = file_path
+
+    @property
+    def name(self) -> str:
+        return self.file_path.name if self.file_path else "metadata.json"
+
+
 def natural_sort_key(s: Union[str, Path]) -> list:
     """Natural numerical sorting key (e.g. frame_2 comes before frame_10)."""
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", str(s))]
@@ -55,14 +70,19 @@ def find_pano_json_pairs(
     input_dir: Union[str, Path],
     image_paths: Optional[List[str]] = None,
     json_paths: Optional[List[str]] = None,
-) -> List[Tuple[Path, Path]]:
+) -> List[Tuple[Path, Union[Path, ARKitCaptureRecord]]]:
     """
-    Match equirectangular panorama image files with their companion ARKit JSON files.
+    Match equirectangular panorama image files with their companion ARKit JSON files or records.
     
     Supports:
-    - Exact match: aSzi0c8BDE.jpg -> aSzi0c8BDE.json
-    - Suffix variations: aSzi0c8BDE_blurred.jpg -> aSzi0c8BDE.json
-    - Manual lists of image_paths and json_paths
+    1. Per-image JSON files:
+       - Exact match: aSzi0c8BDE.jpg -> aSzi0c8BDE.json
+       - Suffix variations: aSzi0c8BDE_blurred.jpg -> aSzi0c8BDE.json
+    2. Single aggregate JSON file (e.g. jobdata.json, metadata.json, poses.json):
+       - JSON containing a list of records with "jobId" or "id"
+       - JSON containing a dict mapping jobId -> record
+       - Preserves scanChain.index ordering if present
+    3. Manual lists of image_paths and json_paths
     """
     input_path = Path(input_dir)
     if not input_path.exists():
@@ -87,14 +107,14 @@ def find_pano_json_pairs(
     else:
         raw_jsons = [Path(p) for p in json_paths]
 
+    # First: Check for 1-to-1 matching per-image JSON files
     json_dict = {f.stem: f for f in raw_jsons}
-
-    pairs = []
+    individual_pairs = []
     for img in raw_images:
         stem = img.stem
         # 1. Exact stem match
         if stem in json_dict:
-            pairs.append((img, json_dict[stem]))
+            individual_pairs.append((img, json_dict[stem]))
             continue
 
         # 2. Match after removing common suffixes like _blurred, _pano, _equirectangular
@@ -103,43 +123,128 @@ def find_pano_json_pairs(
             if stem.startswith(j_stem) or j_stem.startswith(stem):
                 matched_json = j_path
                 break
-            # Check stripping suffix
             cleaned_stem = re.sub(r"(_blurred|_pano|_equirectangular|_360)$", "", stem, flags=re.IGNORECASE)
             if cleaned_stem == j_stem:
                 matched_json = j_path
                 break
 
         if matched_json is not None:
-            pairs.append((img, matched_json))
-        else:
-            print(f"Warning: No matching JSON found for image {img.name}, skipping.")
+            individual_pairs.append((img, matched_json))
 
-    if not pairs:
-        raise ValueError(f"No valid panorama image + ARKit JSON pairs found in {input_dir}")
+    # If individual matching JSONs were found for all or most images, return them
+    if len(individual_pairs) > 0 and len(individual_pairs) >= len(raw_images) * 0.5:
+        individual_pairs.sort(key=lambda pair: natural_sort_key(pair[0].name))
+        return individual_pairs
 
-    # Sort pairs naturally by image filename
-    pairs.sort(key=lambda pair: natural_sort_key(pair[0].name))
-    return pairs
+    # Second: Check for aggregate JSON files (e.g. jobdata.json, metadata.json, or any json with list/dict)
+    def json_candidate_priority(p: Path) -> int:
+        name_lower = p.name.lower()
+        if "jobdata" in name_lower:
+            return 0
+        if "metadata" in name_lower:
+            return 1
+        if "poses" in name_lower:
+            return 2
+        return 3
+
+    sorted_candidate_jsons = sorted(raw_jsons, key=json_candidate_priority)
+
+    for j_path in sorted_candidate_jsons:
+        try:
+            with open(j_path, "r", encoding="utf-8") as f:
+                content = json.load(f)
+        except Exception:
+            continue
+
+        record_map = {}
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    jid = item.get("jobId") or item.get("id") or item.get("sessionId") or item.get("image_name")
+                    if jid:
+                        record_map[str(jid)] = item
+                        record_map[Path(str(jid)).stem] = item
+        elif isinstance(content, dict):
+            if "captures" in content and isinstance(content["captures"], list):
+                for item in content["captures"]:
+                    if isinstance(item, dict):
+                        jid = item.get("jobId") or item.get("id") or item.get("image_name")
+                        if jid:
+                            record_map[str(jid)] = item
+                            record_map[Path(str(jid)).stem] = item
+            else:
+                for k, v in content.items():
+                    if isinstance(v, dict):
+                        record_map[str(k)] = v
+                        record_map[Path(str(k)).stem] = v
+
+        if not record_map:
+            continue
+
+        # Match images against record_map
+        matched_agg_pairs = []
+        for img in raw_images:
+            stem = img.stem
+            cleaned_stem = re.sub(r"(_blurred|_pano|_equirectangular|_360)$", "", stem, flags=re.IGNORECASE)
+            matched_rec = None
+            if stem in record_map:
+                matched_rec = record_map[stem]
+            elif cleaned_stem in record_map:
+                matched_rec = record_map[cleaned_stem]
+            else:
+                for k, v in record_map.items():
+                    if stem.startswith(k) or k.startswith(stem) or cleaned_stem == k:
+                        matched_rec = v
+                        break
+
+            if matched_rec is not None:
+                matched_agg_pairs.append((img, ARKitCaptureRecord(matched_rec, file_path=j_path)))
+            else:
+                print(f"Warning: No matching record found in {j_path.name} for image {img.name}, skipping.")
+
+        if matched_agg_pairs:
+            # Check if records contain scanChain index
+            has_chain_index = any(
+                isinstance(p[1], dict) and p[1].get("scanChain", {}).get("index") is not None
+                for p in matched_agg_pairs
+            )
+            if has_chain_index:
+                # Sort primarily by scan chain index, then by filename
+                matched_agg_pairs.sort(
+                    key=lambda pair: (
+                        pair[1].get("scanChain", {}).get("index", 999999) if isinstance(pair[1], dict) else 999999,
+                        natural_sort_key(pair[0].name)
+                    )
+                )
+            else:
+                matched_agg_pairs.sort(key=lambda pair: natural_sort_key(pair[0].name))
+            return matched_agg_pairs
+
+    if individual_pairs:
+        individual_pairs.sort(key=lambda pair: natural_sort_key(pair[0].name))
+        return individual_pairs
+
+    raise ValueError(f"No valid panorama image + ARKit JSON pairs found in {input_dir}")
 
 
-def load_arkit_metadata(json_path: Union[str, Path]) -> dict:
+def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
     """
-    Load and parse ARKit JSON capture metadata.
+    Load and parse ARKit JSON capture metadata from a file path or a dictionary.
     
-    Expected format:
-    {
-        "magneticHeading": float,
-        "arkitCapture": {
-            "units": "meters",
-            "axes": "camera: +X right, +Y up, look -Z; world: +Y up, yaw0 north, +X east, +Z south",
-            "sphere": {
-                "origin": [X, Y, Z]
-            }
-        }
-    }
+    Supports:
+    - Legacy individual JSON files (with magneticHeading, origin)
+    - New aggregate format (with headingAtPlace in arkitCapture.sphere, scanChain)
+    - Pre-parsed dictionary records
     """
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    if isinstance(json_source, dict):
+        data = json_source
+        source_name = getattr(json_source, "name", "record")
+    elif isinstance(json_source, (str, Path)):
+        source_name = str(json_source)
+        with open(json_source, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        raise ValueError(f"Unsupported json_source type: {type(json_source)}")
 
     # Extract origin
     origin = None
@@ -151,17 +256,33 @@ def load_arkit_metadata(json_path: Union[str, Path]) -> dict:
         origin = data["position"]
 
     if origin is None or len(origin) != 3:
-        raise ValueError(f"Could not extract 3D origin [x, y, z] from {json_path}")
+        raise ValueError(f"Could not extract 3D origin [x, y, z] from {source_name}")
 
-    # Extract heading
+    # Extract heading: check magneticHeading, headingAtPlace (nested or top-level), or heading
     heading = data.get("magneticHeading")
+    if heading is None and "arkitCapture" in data and "sphere" in data["arkitCapture"]:
+        heading = data["arkitCapture"]["sphere"].get("headingAtPlace")
+    if heading is None:
+        heading = data.get("headingAtPlace")
     if heading is None:
         heading = data.get("heading", 0.0)
+
+    # Extract scanChain and heightAboveFloor if present
+    scan_chain = data.get("scanChain", {}) if isinstance(data.get("scanChain"), dict) else {}
+    chain_index = scan_chain.get("index")
+    chain_id = scan_chain.get("chainId")
+    height_above_floor = None
+    if "arkitCapture" in data and "sphere" in data["arkitCapture"]:
+        height_above_floor = data["arkitCapture"]["sphere"].get("heightAboveFloor")
 
     return {
         "raw": data,
         "origin_arkit": np.array(origin, dtype=np.float32),  # [X_east, Y_up, Z_south]
         "magnetic_heading_deg": float(heading),
+        "job_id": data.get("jobId"),
+        "scan_chain_index": chain_index,
+        "chain_id": chain_id,
+        "height_above_floor": float(height_above_floor) if height_above_floor is not None else None,
     }
 
 
@@ -210,10 +331,12 @@ def resolve_anchor_index(anchor_spec: Union[int, str, None], pano_records: List[
             if not (0 <= idx < len(pano_records)):
                 raise ValueError(f"Invalid anchor index {idx}. Expected 0 <= index < {len(pano_records)}.")
             return idx
-        # Match by filename
+        # Match by filename or jobId
         for idx, rec in enumerate(pano_records):
             img_name = rec["image_path"].name
-            if anchor_spec == img_name or anchor_spec == rec["image_path"].stem:
+            stem = rec["image_path"].stem
+            job_id = rec.get("job_id")
+            if anchor_spec in (img_name, stem, job_id):
                 return idx
         available = [r["image_path"].name for r in pano_records]
         raise ValueError(f"Anchor '{anchor_spec}' not found in panorama files: {available}")
@@ -453,10 +576,15 @@ def process_arkit_panoramas(
 
     # Load metadata
     records = []
-    for img_path, json_path in pairs:
-        meta = load_arkit_metadata(json_path)
+    for img_path, json_source in pairs:
+        meta = load_arkit_metadata(json_source)
         meta["image_path"] = img_path
-        meta["json_path"] = json_path
+        if isinstance(json_source, Path):
+            meta["json_path"] = json_source
+        elif hasattr(json_source, "file_path") and json_source.file_path:
+            meta["json_path"] = json_source.file_path
+        else:
+            meta["json_path"] = Path("metadata.json")
         records.append(meta)
 
     # Resolve anchor
@@ -482,7 +610,10 @@ def process_arkit_panoramas(
     for p in normalized_panos:
         level1_export.append({
             "image_name": p["image_path"].name,
-            "json_name": p["json_path"].name,
+            "json_name": p["json_path"].name if hasattr(p["json_path"], "name") else str(p["json_path"]),
+            "job_id": p.get("job_id"),
+            "scan_chain_index": p.get("scan_chain_index"),
+            "height_above_floor": p.get("height_above_floor"),
             "is_anchor": p.get("is_anchor", False),
             "origin_arkit_xyz": p["origin_arkit"].tolist(),
             "magnetic_heading_deg": p["magnetic_heading_deg"],
