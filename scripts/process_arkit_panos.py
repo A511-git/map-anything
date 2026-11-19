@@ -820,6 +820,8 @@ def process_arkit_panoramas(
         "poses_npy": str(poses_npy_path),
         "intrinsics_npy": str(intrinsics_npy_path),
         "poses_json": str(poses_json_path),
+        "level1_metadata_json": str(level1_meta_file),
+        "extracted_views": extracted_views,
         "views": extracted_views,
     }
 

@@ -515,13 +515,23 @@ def generate_camera_markers(
     num_ring_points: int = 72,
     num_sphere_points: int = 150,
     ray_length: float = 0.45,
+    marker_style: str = "all_rays",
     color_palette: Optional[List[Tuple[int, int, int]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate 3D point cloud markers for cameras:
     - A colored solid sphere at each optical center
     - A circular ring around each camera in the horizontal plane (radius in meters)
-    - Forward-pointing sight rays along each camera's +Z optical axis
+    - Forward-pointing sight rays along camera optical axes
+
+    Args:
+        poses: List of 4x4 cam2world camera pose matrices.
+        radius: Radius in meters of the horizontal orientation ring.
+        sphere_radius: Radius in meters of the center station sphere.
+        marker_style: Marker style:
+            - 'all_rays' (default): Sphere + ring + sight rays for all views at this center.
+            - 'station_only': Sphere + ring at each station center (no rays).
+            - 'heading_only': Sphere + ring + single ray along the primary forward heading.
     
     Returns:
         (marker_points, marker_colors) as np.ndarray
@@ -540,13 +550,14 @@ def generate_camera_markers(
     marker_rgb = []
 
     # Cluster/group poses by camera center (optical center)
+    # Using 5 cm threshold ensures all nodal faces of a panorama collapse into 1 station
     centers = []
     center_to_views = {}
     for idx, p in enumerate(poses):
         c = p[:3, 3]
         matched_c_idx = None
         for c_idx, existing_c in enumerate(centers):
-            if np.linalg.norm(c - existing_c) < 0.01:
+            if np.linalg.norm(c - existing_c) < 0.05:
                 matched_c_idx = c_idx
                 break
         if matched_c_idx is None:
@@ -584,18 +595,24 @@ def generate_camera_markers(
         marker_pts.append(ring_pts)
         marker_rgb.append(np.tile(color, (len(ring_pts), 1)).astype(np.uint8))
 
-        # 3. Sight rays for each view originating at this center
-        for view_idx in center_to_views[c_idx]:
-            R = poses[view_idx][:3, :3]
-            forward_dir = R[:, 2]  # +Z forward in OpenCV RDF
-            num_ray_steps = 25
-            ray_pts = []
-            for s in np.linspace(sphere_radius, ray_length, num_ray_steps):
-                ray_pts.append(c + s * forward_dir)
-            ray_pts = np.array(ray_pts, dtype=np.float32)
-            marker_pts.append(ray_pts)
-            ray_color = np.clip(np.array(color, dtype=np.float32) * 1.2, 0, 255).astype(np.uint8)
-            marker_rgb.append(np.tile(ray_color, (len(ray_pts), 1)).astype(np.uint8))
+        # 3. Sight rays for views originating at this center
+        if marker_style != "station_only":
+            views_to_draw = center_to_views[c_idx]
+            if marker_style == "heading_only":
+                # Single primary forward ray (first view at this center)
+                views_to_draw = views_to_draw[:1]
+
+            for view_idx in views_to_draw:
+                R = poses[view_idx][:3, :3]
+                forward_dir = R[:, 2]  # +Z forward in OpenCV RDF
+                num_ray_steps = 25
+                ray_pts = []
+                for s in np.linspace(sphere_radius, ray_length, num_ray_steps):
+                    ray_pts.append(c + s * forward_dir)
+                ray_pts = np.array(ray_pts, dtype=np.float32)
+                marker_pts.append(ray_pts)
+                ray_color = np.clip(np.array(color, dtype=np.float32) * 1.2, 0, 255).astype(np.uint8)
+                marker_rgb.append(np.tile(ray_color, (len(ray_pts), 1)).astype(np.uint8))
 
     if not marker_pts:
         return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
@@ -780,6 +797,29 @@ def _reconstruct_with_model_decided_face_poses(
             )
             parent_to_faces.setdefault(parent_stem, []).append((idx, image_paths[idx], fname))
 
+        # Check candidate locations for normalized_arkit_metadata.json
+        candidate_meta_dirs = []
+        if target_output_dir is not None:
+            candidate_meta_dirs.append(target_output_dir)
+        if len(image_paths) > 0 and isinstance(image_paths[0], (str, Path)):
+            p0 = Path(image_paths[0])
+            candidate_meta_dirs.extend([p0.parent, p0.parent.parent])
+        for cdir in candidate_meta_dirs:
+            meta_f = cdir / "normalized_arkit_metadata.json"
+            if meta_f.is_file():
+                try:
+                    with open(meta_f, "r", encoding="utf-8") as f:
+                        l1_list = json.load(f)
+                    for item in l1_list:
+                        mat = np.array(item["cam2world_pose_4x4"], dtype=np.float32)
+                        pano_global_poses[item["image_name"]] = mat
+                        pano_global_poses[Path(item["image_name"]).stem] = mat
+                        if item.get("job_id"):
+                            pano_global_poses[str(item["job_id"])] = mat
+                    break
+                except Exception:
+                    pass
+
     if not parent_to_faces:
         raise ValueError("Could not group input perspective faces into parent panoramas.")
 
@@ -794,6 +834,27 @@ def _reconstruct_with_model_decided_face_poses(
         print(f"\n[Model Face Poses] Hierarchical mode: processing {total_panos} panoramas ({len(image_paths)} total face views)...")
 
     for pano_idx, (parent_name, face_entries) in enumerate(parent_to_faces.items()):
+        # Sort face views so that front / yaw 0 view is first (View 0).
+        # In MapAnything unposed inference, View 0 defines the coordinate frame origin.
+        # Placing the forward face at index 0 aligns View 0 directly with the panorama's heading.
+        def _face_priority(entry):
+            fname = entry[2].lower()
+            if "_front" in fname or "_yaw_0" in fname or "_yaw0" in fname:
+                return 0
+            elif "_right" in fname or "_yaw_90" in fname or "_yaw90" in fname:
+                return 1
+            elif "_back" in fname or "_yaw_180" in fname or "_yaw180" in fname:
+                return 2
+            elif "_left" in fname or "_yaw_270" in fname or "_yaw270" in fname:
+                return 3
+            elif "_up" in fname or "_pitch_90" in fname:
+                return 4
+            elif "_down" in fname or "_pitch_-90" in fname:
+                return 5
+            return 10
+
+        face_entries.sort(key=_face_priority)
+
         # Determine global parent panorama pose
         if parent_name in pano_global_poses:
             T_pano = pano_global_poses[parent_name]
@@ -802,7 +863,7 @@ def _reconstruct_with_model_decided_face_poses(
         else:
             first_idx = face_entries[0][0]
             if first_idx < len(loaded_poses):
-                T_pano = loaded_poses[first_idx]
+                T_pano = loaded_poses[first_idx].copy()
             else:
                 T_pano = np.eye(4, dtype=np.float32)
 
@@ -865,8 +926,16 @@ def _reconstruct_with_model_decided_face_poses(
             # Model predicted relative face pose in View 0 frame
             T_face_local = pred["camera_poses"][0]  # (4, 4)
 
-            # Compose: T_face_world = T_pano @ T_face_local
-            T_face_world = torch.matmul(T_pano_torch, T_face_local)
+            # Orientations: compose parent panorama orientation with model-predicted local face rotation
+            R_face_world = torch.matmul(T_pano_torch[:3, :3], T_face_local[:3, :3])
+
+            # Nodal optical center lock:
+            # Panoramic perspective faces physically share the exact same optical nodal center (zero baseline).
+            # Any non-zero translation predicted by unconstrained multi-view stereo is synthetic drift.
+            # Strictly enforce t_face_world = t_pano to eliminate camera clustering and depth tears.
+            T_face_world = torch.eye(4, device=device, dtype=torch.float32)
+            T_face_world[:3, :3] = R_face_world
+            T_face_world[:3, 3] = T_pano_torch[:3, 3]
             T_face_world_np = T_face_world.cpu().numpy()
 
             refined_world_poses[face_idx] = T_face_world_np
@@ -947,6 +1016,7 @@ def reconstruct_from_posed_images(
     # Camera visualization options:
     add_camera_markers: bool = True,
     marker_radius: float = 0.25,
+    marker_style: str = "all_rays",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run MapAnything inference using input images and their known camera poses,
@@ -1288,7 +1358,7 @@ def reconstruct_from_posed_images(
                 except Exception:
                     marker_poses = loaded_poses
             cam_marker_pts, cam_marker_rgb = generate_camera_markers(
-                marker_poses, radius=marker_radius
+                marker_poses, radius=marker_radius, marker_style=marker_style
             )
             camera_markers_tuple = (cam_marker_pts, cam_marker_rgb)
 
@@ -1472,6 +1542,13 @@ def main():
         help="Radius of camera circle markers in meters (default: 0.25m).",
     )
     parser.add_argument(
+        "--marker_style",
+        type=str,
+        default="all_rays",
+        choices=["all_rays", "station_only", "heading_only"],
+        help="Camera marker visualization style: 'all_rays' (sphere + ring + rays for all views), 'station_only' (sphere + ring at each station), 'heading_only' (sphere + ring + 1 forward heading ray).",
+    )
+    parser.add_argument(
         "--model_decides_face_poses",
         action="store_true",
         default=False,
@@ -1515,6 +1592,7 @@ def main():
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,
         marker_radius=args.marker_radius,
+        marker_style=args.marker_style,
     )
 
 
