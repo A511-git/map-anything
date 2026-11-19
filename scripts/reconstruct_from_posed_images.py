@@ -710,6 +710,210 @@ def export_point_cloud(
             raise RuntimeError(f"Failed to export PLY point cloud: {e}")
 
 
+def _reconstruct_with_model_decided_face_poses(
+    model,
+    device,
+    image_paths: List[str],
+    image_filenames: List[str],
+    loaded_intrinsics: Optional[List[np.ndarray]],
+    loaded_poses: List[np.ndarray],
+    pano_res: Optional[dict] = None,
+    target_output_dir: Optional[Path] = None,
+    is_metric_scale: bool = True,
+    resolved_amp_dtype: str = "bf16",
+    apply_mask: bool = True,
+    mask_edges: bool = True,
+    use_multiview_confidence: bool = False,
+    apply_confidence_mask: bool = False,
+    confidence_percentile: float = 10.0,
+    minibatch_size: int = 1,
+    max_depth: Optional[float] = None,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+    """
+    Per-panorama hierarchical reconstruction:
+    1. Groups perspective face views by parent panorama.
+    2. Runs MapAnything inference on each panorama's faces unposed, allowing the model
+       to predict the relative face poses, metric depth, and intrinsics.
+    3. Rigidly anchors the predicted local cameras and points to the known global pose
+       of the panorama as a whole:
+           T_face_world = T_pano_world @ T_face_local
+           P_world = T_pano_world @ P_local
+    4. Merges all world point clouds and saves refined camera poses.
+    """
+    from mapanything.utils.image import preprocess_inputs
+    from mapanything.utils.geometry import depthmap_to_world_frame
+
+    # 1. Group face views by parent panorama
+    parent_to_faces: Dict[str, List[Tuple[int, str, str]]] = {}
+    pano_global_poses: Dict[str, np.ndarray] = {}
+
+    if pano_res is not None and "extracted_views" in pano_res:
+        fname_to_idx = {name: idx for idx, name in enumerate(image_filenames)}
+        for idx_ev, ev in enumerate(pano_res["extracted_views"]):
+            parent = ev.get("parent_pano", "")
+            fname = ev.get("image_name", "")
+            actual_idx = fname_to_idx.get(fname, idx_ev)
+            if actual_idx < len(image_paths):
+                parent_to_faces.setdefault(parent, []).append(
+                    (actual_idx, image_paths[actual_idx], image_filenames[actual_idx])
+                )
+
+        if "level1_metadata_json" in pano_res and Path(pano_res["level1_metadata_json"]).is_file():
+            with open(pano_res["level1_metadata_json"], "r", encoding="utf-8") as f:
+                l1_list = json.load(f)
+            for item in l1_list:
+                mat = np.array(item["cam2world_pose_4x4"], dtype=np.float32)
+                pano_global_poses[item["image_name"]] = mat
+                pano_global_poses[Path(item["image_name"]).stem] = mat
+                if item.get("job_id"):
+                    pano_global_poses[str(item["job_id"])] = mat
+    else:
+        # Regex grouping by stem prefix
+        for idx, fname in enumerate(image_filenames):
+            stem = Path(fname).stem
+            parent_stem = re.sub(
+                r"(_front|_right|_back|_left|_top|_up|_bottom|_down|_face_\d+|_yaw[-_]?\d+|_pitch[-_]?\d+).*$",
+                "",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            parent_to_faces.setdefault(parent_stem, []).append((idx, image_paths[idx], fname))
+
+    if not parent_to_faces:
+        raise ValueError("Could not group input perspective faces into parent panoramas.")
+
+    # 2. Process each panorama
+    all_points = []
+    all_colors = []
+    refined_world_poses = [None] * len(image_paths)
+    refined_poses_dict = {}
+
+    total_panos = len(parent_to_faces)
+    if verbose:
+        print(f"\n[Model Face Poses] Hierarchical mode: processing {total_panos} panoramas ({len(image_paths)} total face views)...")
+
+    for pano_idx, (parent_name, face_entries) in enumerate(parent_to_faces.items()):
+        # Determine global parent panorama pose
+        if parent_name in pano_global_poses:
+            T_pano = pano_global_poses[parent_name]
+        elif Path(parent_name).stem in pano_global_poses:
+            T_pano = pano_global_poses[Path(parent_name).stem]
+        else:
+            first_idx = face_entries[0][0]
+            if first_idx < len(loaded_poses):
+                T_pano = loaded_poses[first_idx]
+            else:
+                T_pano = np.eye(4, dtype=np.float32)
+
+        if verbose:
+            print(f"\n--- Panorama {pano_idx + 1}/{total_panos}: '{parent_name}' ({len(face_entries)} faces) ---")
+            print(f"  Parent Anchor World Position: [{T_pano[0, 3]:.3f}, {T_pano[1, 3]:.3f}, {T_pano[2, 3]:.3f}] m")
+
+        # Construct unposed view dicts
+        pano_raw_views = []
+        for face_idx, img_item, fname in face_entries:
+            if isinstance(img_item, (str, Path)):
+                pil_img = Image.open(img_item).convert("RGB")
+                img_arr = np.array(pil_img, dtype=np.uint8)
+            elif isinstance(img_item, Image.Image):
+                img_arr = np.array(img_item.convert("RGB"), dtype=np.uint8)
+            elif isinstance(img_item, np.ndarray):
+                img_arr = img_item.astype(np.uint8) if img_item.dtype != np.uint8 else img_item
+            else:
+                raise ValueError(f"Unsupported image type: {type(img_item)}")
+
+            v_dict = {
+                "img": torch.from_numpy(img_arr),
+                "is_metric_scale": torch.tensor([is_metric_scale]),
+            }
+            if loaded_intrinsics is not None and face_idx < len(loaded_intrinsics):
+                v_dict["intrinsics"] = torch.from_numpy(loaded_intrinsics[face_idx])
+            pano_raw_views.append(v_dict)
+
+        pano_proc_views = preprocess_inputs(pano_raw_views, verbose=False)
+
+        # Run unposed inference so MapAnything estimates relative face poses
+        pano_outputs = model.infer(
+            pano_proc_views,
+            memory_efficient_inference=True,
+            minibatch_size=minibatch_size,
+            use_amp=(resolved_amp_dtype != "fp32"),
+            amp_dtype=resolved_amp_dtype,
+            apply_mask=apply_mask,
+            mask_edges=mask_edges,
+            use_multiview_confidence=use_multiview_confidence,
+            apply_confidence_mask=apply_confidence_mask,
+            confidence_percentile=confidence_percentile,
+            ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
+            ignore_depth_inputs=True,
+            ignore_pose_inputs=True,  # Crucial: let model decide face poses!
+            ignore_pose_scale_inputs=not is_metric_scale,
+        )
+
+        T_pano_torch = torch.from_numpy(T_pano).to(device=device, dtype=torch.float32)
+
+        # Unproject points and anchor to world pose
+        pano_points = 0
+        for j, (face_idx, _, fname) in enumerate(face_entries):
+            pred = pano_outputs[j]
+            depth_z = pred["depth_z"][0].squeeze(-1)  # (H, W)
+            intrinsics_view = pred["intrinsics"][0]  # (3, 3)
+            mask = pred["mask"][0].squeeze(-1).bool()
+            img_no_norm = pred["img_no_norm"][0]
+
+            # Model predicted relative face pose in View 0 frame
+            T_face_local = pred["camera_poses"][0]  # (4, 4)
+
+            # Compose: T_face_world = T_pano @ T_face_local
+            T_face_world = torch.matmul(T_pano_torch, T_face_local)
+            T_face_world_np = T_face_world.cpu().numpy()
+
+            refined_world_poses[face_idx] = T_face_world_np
+            refined_poses_dict[fname] = T_face_world_np.tolist()
+
+            # Direct metric world unprojection
+            pts3d_world, valid_depth = depthmap_to_world_frame(depth_z, intrinsics_view, T_face_world)
+            valid_mask = mask & valid_depth
+
+            if max_depth is not None and max_depth > 0:
+                valid_mask = valid_mask & (depth_z <= max_depth)
+
+            valid_mask_np = valid_mask.cpu().numpy()
+            pts_np = pts3d_world.cpu().numpy()[valid_mask_np]
+            rgb_np = (img_no_norm.cpu().numpy()[valid_mask_np] * 255.0).clip(0, 255).astype(np.uint8)
+
+            if len(pts_np) > 0:
+                all_points.append(pts_np)
+                all_colors.append(rgb_np)
+                pano_points += len(pts_np)
+
+        if verbose:
+            print(f"  -> Generated {pano_points:,} world 3D points for '{parent_name}'.")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not all_points:
+        raise RuntimeError("No valid 3D points produced. Check inputs or loosen mask/confidence thresholds.")
+
+    combined_points = np.concatenate(all_points, axis=0)
+    combined_colors = np.concatenate(all_colors, axis=0)
+
+    # Save refined poses
+    if target_output_dir is not None:
+        target_output_dir.mkdir(parents=True, exist_ok=True)
+        valid_poses = [p if p is not None else np.eye(4, dtype=np.float32) for p in refined_world_poses]
+        np.save(target_output_dir / "model_refined_poses.npy", np.array(valid_poses, dtype=np.float32))
+        with open(target_output_dir / "model_refined_poses.json", "w", encoding="utf-8") as f:
+            json.dump(refined_poses_dict, f, indent=2)
+        if verbose:
+            print(f"\n[Export] Saved model-refined poses to: {target_output_dir / 'model_refined_poses.npy'}")
+
+    valid_refined_poses = [p if p is not None else np.eye(4, dtype=np.float32) for p in refined_world_poses]
+    return combined_points, combined_colors, valid_refined_poses
+
+
 def reconstruct_from_posed_images(
     images: Union[str, Path, List[Union[str, Path, np.ndarray, Image.Image]]],
     poses: Optional[Union[str, Path, List[np.ndarray], np.ndarray]] = None,
@@ -717,6 +921,7 @@ def reconstruct_from_posed_images(
     pose_convention: str = "opencv",
     is_metric_scale: bool = True,
     use_exact_input_poses: bool = True,
+    model_decides_face_poses: bool = False,
     model: Optional[object] = None,
     model_name: str = "facebook/map-anything",
     device: Optional[str] = None,
@@ -760,44 +965,47 @@ def reconstruct_from_posed_images(
         print(f"[Output] Target reconstruction path: {resolved_output_path}")
 
     # 0.1. Auto-detection & routing for raw ARKit panoramas or pre-existing poses
-    if poses is None and (isinstance(images, (str, Path)) or (isinstance(images, list) and len(images) == 1)):
-        folder_candidate = Path(images if isinstance(images, (str, Path)) else images[0])
-        if folder_candidate.is_dir():
-            # Check 1: Does the folder contain raw ARKit panoramas (*.jpg + *.json)?
-            try:
-                from scripts.process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
-            except ModuleNotFoundError:
-                from process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
+    pano_res = None
+    folder_candidate = Path(images if isinstance(images, (str, Path)) else images[0]) if (isinstance(images, (str, Path)) or (isinstance(images, list) and len(images) == 1)) else None
+    if folder_candidate and folder_candidate.is_dir():
+        # Check 1: Does the folder contain raw ARKit panoramas (*.jpg + *.json)?
+        try:
+            from scripts.process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
+        except ModuleNotFoundError:
+            from process_arkit_panos import is_arkit_pano_directory, process_arkit_panoramas
 
-            if is_arkit_pano_directory(folder_candidate):
-                if verbose:
-                    print(f"\n[Auto-Route] Detected raw ARKit panoramas in: {folder_candidate}")
-                    print(f"[Auto-Route] Splitting panoramas into '{split_mode}' perspective views (FoV: {fov_deg}°) with anchor: {anchor}...")
+        if is_arkit_pano_directory(folder_candidate):
+            if verbose:
+                print(f"\n[Auto-Route] Detected raw ARKit panoramas in: {folder_candidate}")
+                print(f"[Auto-Route] Splitting panoramas into '{split_mode}' perspective views (FoV: {fov_deg}°) with anchor: {anchor}...")
 
-                if cache_dir is not None:
-                    proc_out_dir = Path(cache_dir)
-                elif target_output_dir is not None:
-                    proc_out_dir = target_output_dir
-                else:
-                    proc_out_dir = Path("output") / folder_candidate.name
+            if cache_dir is not None:
+                proc_out_dir = Path(cache_dir)
+            elif target_output_dir is not None:
+                proc_out_dir = target_output_dir
+            else:
+                proc_out_dir = Path("output") / folder_candidate.name
 
-                res = process_arkit_panoramas(
-                    input_dir=folder_candidate,
-                    output_dir=proc_out_dir,
-                    split_mode=split_mode,
-                    face_size=face_size,
-                    fov_deg=fov_deg,
-                    heading_mode=heading_mode,
-                    anchor=anchor,
-                    verbose=verbose,
-                )
-                images = res["images_dir"]
+            res = process_arkit_panoramas(
+                input_dir=folder_candidate,
+                output_dir=proc_out_dir,
+                split_mode=split_mode,
+                face_size=face_size,
+                fov_deg=fov_deg,
+                heading_mode=heading_mode,
+                anchor=anchor,
+                verbose=verbose,
+            )
+            pano_res = res
+            images = res["images_dir"]
+            if poses is None:
                 poses = res["poses_npy"]
-                if intrinsics is None:
-                    intrinsics = res["intrinsics_npy"]
+            if intrinsics is None:
+                intrinsics = res["intrinsics_npy"]
 
+        elif poses is None:
             # Check 2: Does the folder already contain poses.npy or poses.json?
-            elif (folder_candidate / "poses.npy").is_file():
+            if (folder_candidate / "poses.npy").is_file():
                 poses = str(folder_candidate / "poses.npy")
                 if verbose:
                     print(f"[Auto-Route] Auto-detected poses array: {poses}")
@@ -848,7 +1056,7 @@ def reconstruct_from_posed_images(
     if isinstance(poses, (str, Path)):
         loaded_poses = load_poses(
             str(poses),
-            num_expected=num_views,
+            num_expected=None if model_decides_face_poses else num_views,
             pose_convention=pose_convention,
             image_filenames=image_filenames,
         )
@@ -864,7 +1072,7 @@ def reconstruct_from_posed_images(
     else:
         raise ValueError(f"Unsupported type for poses: {type(poses)}")
 
-    if len(loaded_poses) != num_views:
+    if not model_decides_face_poses and len(loaded_poses) != num_views:
         raise ValueError(f"Mismatch between number of images ({num_views}) and poses ({len(loaded_poses)})")
 
     # 3. Gather optional camera intrinsics
@@ -872,38 +1080,7 @@ def reconstruct_from_posed_images(
     if loaded_intrinsics is not None and verbose:
         print(f"Loaded {len(loaded_intrinsics)} camera intrinsics matrices.")
 
-    # 4. Construct view dictionaries
-    raw_views = []
-    for i in range(num_views):
-        item = image_paths[i]
-        if isinstance(item, (str, Path)):
-            pil_img = Image.open(item).convert("RGB")
-            img_arr = np.array(pil_img, dtype=np.uint8)
-        elif isinstance(item, Image.Image):
-            img_arr = np.array(item.convert("RGB"), dtype=np.uint8)
-        elif isinstance(item, np.ndarray):
-            img_arr = item.astype(np.uint8) if item.dtype != np.uint8 else item
-        else:
-            raise ValueError(f"Unsupported image item type at index {i}: {type(item)}")
-
-        view_dict = {
-            "img": torch.from_numpy(img_arr),  # (H, W, 3) [0, 255]
-            "camera_poses": torch.from_numpy(loaded_poses[i]),  # (4, 4) OpenCV cam2world
-            "is_metric_scale": torch.tensor([is_metric_scale]),
-        }
-
-        if loaded_intrinsics is not None:
-            view_dict["intrinsics"] = torch.from_numpy(loaded_intrinsics[i])
-
-        raw_views.append(view_dict)
-
-    # 5. Preprocess inputs (determines aspect ratio, resizes, scales intrinsics, normalizes)
-    if verbose:
-        print("Preprocessing input views (aspect ratio mapping & normalization)...")
-    from mapanything.utils.image import preprocess_inputs
-    processed_views = preprocess_inputs(raw_views, verbose=False)
-
-    # 6. Lazy load MapAnything model
+    # 4. Lazy load MapAnything model
     from mapanything.models import MapAnything
     from mapanything.utils.device import get_device
     from mapanything.utils.geometry import depthmap_to_world_frame
@@ -917,7 +1094,6 @@ def reconstruct_from_posed_images(
         model = MapAnything.from_pretrained(model_name).to(device)
     model.eval()
 
-    # 7. Run inference
     # Determine AMP dtype with automatic SM75 (Turing / T4) fallback to FP16
     resolved_amp_dtype = amp_dtype
     if resolved_amp_dtype == "auto" or resolved_amp_dtype is None:
@@ -936,31 +1112,108 @@ def reconstruct_from_posed_images(
     if verbose:
         print(f"Mixed precision configured: AMP={resolved_amp_dtype.upper()} (hardware-matched).")
 
-    # Auto-detect safe chunk size if not explicitly set and running on limited GPU memory
-    effective_chunk_size = chunk_size
-    if effective_chunk_size is None and len(processed_views) > 6 and torch.cuda.is_available():
-        try:
-            total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            if total_mem_gb <= 16.5:
-                effective_chunk_size = 4
-                if verbose:
-                    print(f"Auto-selected chunk_size={effective_chunk_size} (detected {total_mem_gb:.1f} GB GPU memory and {len(processed_views)} views) to prevent CUDA OOM.")
-        except Exception:
-            pass
+    outputs = None
+    if model_decides_face_poses:
+        combined_points, combined_colors, loaded_poses = _reconstruct_with_model_decided_face_poses(
+            model=model,
+            device=device,
+            image_paths=image_paths,
+            image_filenames=image_filenames,
+            loaded_intrinsics=loaded_intrinsics,
+            loaded_poses=loaded_poses,
+            pano_res=pano_res,
+            target_output_dir=target_output_dir,
+            is_metric_scale=is_metric_scale,
+            resolved_amp_dtype=resolved_amp_dtype,
+            apply_mask=apply_mask,
+            mask_edges=mask_edges,
+            use_multiview_confidence=use_multiview_confidence,
+            apply_confidence_mask=apply_confidence_mask,
+            confidence_percentile=confidence_percentile,
+            minibatch_size=minibatch_size,
+            max_depth=max_depth,
+            verbose=verbose,
+        )
+    else:
+        # 5. Construct view dictionaries
+        raw_views = []
+        for i in range(num_views):
+            item = image_paths[i]
+            if isinstance(item, (str, Path)):
+                pil_img = Image.open(item).convert("RGB")
+                img_arr = np.array(pil_img, dtype=np.uint8)
+            elif isinstance(item, Image.Image):
+                img_arr = np.array(item.convert("RGB"), dtype=np.uint8)
+            elif isinstance(item, np.ndarray):
+                img_arr = item.astype(np.uint8) if item.dtype != np.uint8 else item
+            else:
+                raise ValueError(f"Unsupported image item type at index {i}: {type(item)}")
 
-    if effective_chunk_size is not None and effective_chunk_size > 0 and effective_chunk_size < len(processed_views):
+            view_dict = {
+                "img": torch.from_numpy(img_arr),  # (H, W, 3) [0, 255]
+                "camera_poses": torch.from_numpy(loaded_poses[i]),  # (4, 4) OpenCV cam2world
+                "is_metric_scale": torch.tensor([is_metric_scale]),
+            }
+
+            if loaded_intrinsics is not None:
+                view_dict["intrinsics"] = torch.from_numpy(loaded_intrinsics[i])
+
+            raw_views.append(view_dict)
+
+        # 6. Preprocess inputs (determines aspect ratio, resizes, scales intrinsics, normalizes)
         if verbose:
-            print(f"Running chunked multi-modal inference ({effective_chunk_size} views/chunk across {len(processed_views)} total views)...")
-        outputs = []
-        num_chunks = (len(processed_views) + effective_chunk_size - 1) // effective_chunk_size
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * effective_chunk_size
-            end = min(start + effective_chunk_size, len(processed_views))
-            chunk_views = processed_views[start:end]
+            print("Preprocessing input views (aspect ratio mapping & normalization)...")
+        from mapanything.utils.image import preprocess_inputs
+        processed_views = preprocess_inputs(raw_views, verbose=False)
+
+        # 7. Run inference
+        # Auto-detect safe chunk size if not explicitly set and running on limited GPU memory
+        effective_chunk_size = chunk_size
+        if effective_chunk_size is None and len(processed_views) > 6 and torch.cuda.is_available():
+            try:
+                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if total_mem_gb <= 16.5:
+                    effective_chunk_size = 4
+                    if verbose:
+                        print(f"Auto-selected chunk_size={effective_chunk_size} (detected {total_mem_gb:.1f} GB GPU memory and {len(processed_views)} views) to prevent CUDA OOM.")
+            except Exception:
+                pass
+
+        if effective_chunk_size is not None and effective_chunk_size > 0 and effective_chunk_size < len(processed_views):
             if verbose:
-                print(f"  Chunk {chunk_idx + 1}/{num_chunks}: views [{start}..{end - 1}] ({len(chunk_views)} views)...")
-            chunk_outputs = model.infer(
-                chunk_views,
+                print(f"Running chunked multi-modal inference ({effective_chunk_size} views/chunk across {len(processed_views)} total views)...")
+            outputs = []
+            num_chunks = (len(processed_views) + effective_chunk_size - 1) // effective_chunk_size
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * effective_chunk_size
+                end = min(start + effective_chunk_size, len(processed_views))
+                chunk_views = processed_views[start:end]
+                if verbose:
+                    print(f"  Chunk {chunk_idx + 1}/{num_chunks}: views [{start}..{end - 1}] ({len(chunk_views)} views)...")
+                chunk_outputs = model.infer(
+                    chunk_views,
+                    memory_efficient_inference=True,
+                    minibatch_size=minibatch_size,
+                    use_amp=True,
+                    amp_dtype=resolved_amp_dtype,
+                    apply_mask=apply_mask,
+                    mask_edges=mask_edges,
+                    use_multiview_confidence=use_multiview_confidence,
+                    apply_confidence_mask=apply_confidence_mask,
+                    confidence_percentile=confidence_percentile,
+                    ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
+                    ignore_depth_inputs=True,
+                    ignore_pose_inputs=False,  # Fuse input poses in latent space
+                    ignore_pose_scale_inputs=not is_metric_scale,
+                )
+                outputs.extend(chunk_outputs)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        else:
+            if verbose:
+                print("Running feed-forward multi-modal inference with input camera poses...")
+            outputs = model.infer(
+                processed_views,
                 memory_efficient_inference=True,
                 minibatch_size=minibatch_size,
                 use_amp=True,
@@ -975,76 +1228,54 @@ def reconstruct_from_posed_images(
                 ignore_pose_inputs=False,  # Fuse input poses in latent space
                 ignore_pose_scale_inputs=not is_metric_scale,
             )
-            outputs.extend(chunk_outputs)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    else:
-        if verbose:
-            print("Running feed-forward multi-modal inference with input camera poses...")
-        outputs = model.infer(
-            processed_views,
-            memory_efficient_inference=True,
-            minibatch_size=minibatch_size,
-            use_amp=True,
-            amp_dtype=resolved_amp_dtype,
-            apply_mask=apply_mask,
-            mask_edges=mask_edges,
-            use_multiview_confidence=use_multiview_confidence,
-            apply_confidence_mask=apply_confidence_mask,
-            confidence_percentile=confidence_percentile,
-            ignore_calibration_inputs=False if loaded_intrinsics is not None else True,
-            ignore_depth_inputs=True,
-            ignore_pose_inputs=False,  # Fuse input poses in latent space
-            ignore_pose_scale_inputs=not is_metric_scale,
-        )
-
-    if verbose:
-        print("Inference completed! Unprojecting and assembling point clouds...")
-
-    # 8. Unproject depth into world coordinates
-    all_points = []
-    all_colors = []
-
-    for view_idx, pred in enumerate(outputs):
-        depth_z = pred["depth_z"][0].squeeze(-1)  # (H, W) in camera frame
-        intrinsics_view = pred["intrinsics"][0]  # (3, 3) recovered or resized intrinsics
-        mask = pred["mask"][0].squeeze(-1).bool()  # (H, W)
-        img_no_norm = pred["img_no_norm"][0]  # (H, W, 3) [0, 1]
-
-        if use_exact_input_poses:
-            # Exact user-provided pose
-            exact_pose_torch = torch.from_numpy(loaded_poses[view_idx]).to(device=depth_z.device, dtype=depth_z.dtype)
-            pts3d_world, valid_depth = depthmap_to_world_frame(depth_z, intrinsics_view, exact_pose_torch)
-            valid_mask = mask & valid_depth
-        else:
-            # Model's predicted pose (in View 0's reference frame)
-            pts3d_world = pred["pts3d"][0]
-            valid_depth = depth_z > 0
-            valid_mask = mask & valid_depth
-
-        # Optional max-depth clipping (eliminates sky/infinity points)
-        if max_depth is not None and max_depth > 0:
-            valid_mask = valid_mask & (depth_z <= max_depth)
-
-        valid_mask_np = valid_mask.cpu().numpy()
-        pts_np = pts3d_world.cpu().numpy()[valid_mask_np]
-        rgb_np = (img_no_norm.cpu().numpy()[valid_mask_np] * 255.0).clip(0, 255).astype(np.uint8)
-
-        if len(pts_np) > 0:
-            all_points.append(pts_np)
-            all_colors.append(rgb_np)
 
         if verbose:
-            print(f"  View {view_idx + 1}/{num_views} ({image_filenames[view_idx]}): {len(pts_np):,} valid 3D points.")
+            print("Inference completed! Unprojecting and assembling point clouds...")
 
-    if not all_points:
-        raise RuntimeError("No valid 3D points produced. Check your inputs or loosen mask/confidence/depth thresholds.")
+        # 8. Unproject depth into world coordinates
+        all_points = []
+        all_colors = []
 
-    combined_points = np.concatenate(all_points, axis=0)
-    combined_colors = np.concatenate(all_colors, axis=0)
+        for view_idx, pred in enumerate(outputs):
+            depth_z = pred["depth_z"][0].squeeze(-1)  # (H, W) in camera frame
+            intrinsics_view = pred["intrinsics"][0]  # (3, 3) recovered or resized intrinsics
+            mask = pred["mask"][0].squeeze(-1).bool()  # (H, W)
+            img_no_norm = pred["img_no_norm"][0]  # (H, W, 3) [0, 1]
 
-    if verbose:
-        print(f"Total points assembled across {num_views} views: {len(combined_points):,}")
+            if use_exact_input_poses:
+                # Exact user-provided pose
+                exact_pose_torch = torch.from_numpy(loaded_poses[view_idx]).to(device=depth_z.device, dtype=depth_z.dtype)
+                pts3d_world, valid_depth = depthmap_to_world_frame(depth_z, intrinsics_view, exact_pose_torch)
+                valid_mask = mask & valid_depth
+            else:
+                # Model's predicted pose (in View 0's reference frame)
+                pts3d_world = pred["pts3d"][0]
+                valid_depth = depth_z > 0
+                valid_mask = mask & valid_depth
+
+            # Optional max-depth clipping (eliminates sky/infinity points)
+            if max_depth is not None and max_depth > 0:
+                valid_mask = valid_mask & (depth_z <= max_depth)
+
+            valid_mask_np = valid_mask.cpu().numpy()
+            pts_np = pts3d_world.cpu().numpy()[valid_mask_np]
+            rgb_np = (img_no_norm.cpu().numpy()[valid_mask_np] * 255.0).clip(0, 255).astype(np.uint8)
+
+            if len(pts_np) > 0:
+                all_points.append(pts_np)
+                all_colors.append(rgb_np)
+
+            if verbose:
+                print(f"  View {view_idx + 1}/{num_views} ({image_filenames[view_idx]}): {len(pts_np):,} valid 3D points.")
+
+        if not all_points:
+            raise RuntimeError("No valid 3D points produced. Check your inputs or loosen mask/confidence/depth thresholds.")
+
+        combined_points = np.concatenate(all_points, axis=0)
+        combined_colors = np.concatenate(all_colors, axis=0)
+
+        if verbose:
+            print(f"Total points assembled across {num_views} views: {len(combined_points):,}")
 
     # 9. Export if output path is requested
     if resolved_output_path is not None:
@@ -1240,6 +1471,12 @@ def main():
         default=0.25,
         help="Radius of camera circle markers in meters (default: 0.25m).",
     )
+    parser.add_argument(
+        "--model_decides_face_poses",
+        action="store_true",
+        default=False,
+        help="Let the MapAnything model estimate the relative camera pose of each perspective face within a panorama, while anchoring the panorama as a whole using the provided global ARKit/GPS pose.",
+    )
 
     args = parser.parse_args()
 
@@ -1258,6 +1495,7 @@ def main():
         pose_convention=args.pose_convention,
         is_metric_scale=args.is_metric,
         use_exact_input_poses=args.use_exact_input_poses,
+        model_decides_face_poses=args.model_decides_face_poses,
         model_name=model_name,
         device=args.device,
         output_path=args.output,
