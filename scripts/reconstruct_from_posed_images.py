@@ -150,6 +150,120 @@ def convert_pose_convention(pose: np.ndarray, from_convention: str = "opencv") -
         )
 
 
+def _parse_jobdata_poses(
+    content: list,
+    image_filenames: Optional[List[str]] = None,
+) -> List[np.ndarray]:
+    """
+    Parse camera poses from an ARKit scan chain JSON (e.g. jobdata.json).
+    - Sorts records by scanChain.index (1 to N)
+    - Synthesizes pose for terminal node (where arKitData is None) from previous node's destination
+    - Converts ARKit column-major simd_float4x4 to OpenCV RDF cam2world (+X Right, +Y Down, +Z Forward)
+    - Matches image filenames by jobId, stem, or sequential index
+    """
+    # 1. Sort by scanChain.index if available
+    records = sorted(
+        content,
+        key=lambda x: x.get("scanChain", {}).get("index", 999999) if isinstance(x, dict) else 999999
+    )
+
+    # 2. Resolve terminal nodes where arKitData is None from previous node's destination
+    for i, item in enumerate(records):
+        if not isinstance(item, dict):
+            continue
+        if item.get("arKitData") is None and i > 0 and isinstance(records[i - 1], dict) and records[i - 1].get("arKitData") is not None:
+            prev_arkit = records[i - 1]["arKitData"]
+            item["arKitData"] = {
+                "origin": prev_arkit.get("destination"),
+                "originPose": prev_arkit.get("destinationPose"),
+                "originHeading": prev_arkit.get("destinationHeading"),
+                "destination": None,
+                "destinationPose": None,
+                "destinationHeading": None,
+                "distanceMeters": 0.0,
+                "horizontalDistanceMeters": 0.0,
+                "isTerminal": True,
+            }
+
+    # 3. Transform ARKit coordinates to OpenCV RDF cam2world:
+    # M_world = diag([1, -1, -1, 1]), M_cam = diag([1, -1, -1, 1])
+    # T_c2w_cv = M_world @ T_c2w_arkit @ M_cam
+    M = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    name_to_pose = {}
+    ordered_poses = []
+
+    for idx, item in enumerate(records):
+        jid = str(item.get("jobId", f"node_{idx}"))
+        arkit = item.get("arKitData") if isinstance(item, dict) else None
+        c2w_cv = None
+
+        if isinstance(arkit, dict) and "originPose" in arkit:
+            raw_p = arkit["originPose"]
+            if isinstance(raw_p, (list, tuple)) and len(raw_p) == 16:
+                c2w_arkit = np.array(raw_p, dtype=np.float32).reshape((4, 4), order="F")
+                c2w_cv = M @ c2w_arkit @ M
+
+        if c2w_cv is None and isinstance(arkit, dict) and "origin" in arkit:
+            o = arkit["origin"]
+            if isinstance(o, dict):
+                ox = float(o.get("x", 0.0))
+                oy = -float(o.get("y", 0.0))
+                oz = -float(o.get("z", 0.0))
+            else:
+                ox, oy, oz = float(o[0]), -float(o[1]), -float(o[2])
+            h_deg = float(arkit.get("originHeading", 0.0))
+            rad = np.radians(h_deg)
+            cos_a = np.cos(rad)
+            sin_a = np.sin(rad)
+            c2w_cv = np.eye(4, dtype=np.float32)
+            c2w_cv[0, 0] = cos_a
+            c2w_cv[0, 2] = sin_a
+            c2w_cv[2, 0] = -sin_a
+            c2w_cv[2, 2] = cos_a
+            c2w_cv[:3, 3] = [ox, oy, oz]
+
+        if c2w_cv is None:
+            c2w_cv = np.eye(4, dtype=np.float32)
+
+        ordered_poses.append(c2w_cv)
+
+        # Register lookup aliases
+        aliases = [
+            jid,
+            f"{jid}.jpg", f"{jid}.jpeg", f"{jid}.png", f"{jid}.webp",
+            f"{jid}_blurred.jpg", f"{jid}_blurred.png",
+            f"{jid}_pano.jpg", f"{jid}_pano.png",
+            f"frame_{idx}", f"frame_{idx+1}",
+        ]
+        for a in aliases:
+            name_to_pose[a] = c2w_cv
+            name_to_pose[Path(a).name] = c2w_cv
+            name_to_pose[Path(a).stem] = c2w_cv
+
+    if image_filenames:
+        matched = []
+        all_matched = True
+        for fname in image_filenames:
+            stem = Path(fname).stem
+            cleaned_stem = re.sub(r"(_blurred|_pano|_equirectangular|_360)$", "", stem, flags=re.IGNORECASE)
+            if fname in name_to_pose:
+                matched.append(name_to_pose[fname])
+            elif stem in name_to_pose:
+                matched.append(name_to_pose[stem])
+            elif cleaned_stem in name_to_pose:
+                matched.append(name_to_pose[cleaned_stem])
+            else:
+                all_matched = False
+                break
+        if all_matched and len(matched) == len(image_filenames):
+            return matched
+
+        if len(ordered_poses) == len(image_filenames):
+            return ordered_poses
+
+    return ordered_poses
+
+
 def load_poses(
     poses_path: str,
     num_expected: Optional[int] = None,
@@ -197,6 +311,16 @@ def load_poses(
                 content = json.load(f)
             if isinstance(content, list):
                 if len(content) > 0 and isinstance(content[0], dict):
+                    # Check if this is an ARKit jobdata scan chain (containing jobId, scanChain, or arKitData)
+                    if any("jobId" in item or "scanChain" in item or "arKitData" in item for item in content if isinstance(item, dict)):
+                        poses = _parse_jobdata_poses(content, image_filenames=image_filenames)
+                        if num_expected is not None and len(poses) != num_expected:
+                            raise ValueError(f"Number of loaded poses ({len(poses)}) does not match number of images ({num_expected})")
+                        # _parse_jobdata_poses produces OpenCV RDF cam2world directly; if another convention requested, convert:
+                        if pose_convention != "opencv":
+                            poses = [convert_pose_convention(p, from_convention=pose_convention) for p in poses]
+                        return poses
+
                     name_to_pose = {}
                     for item in content:
                         name = item.get("image_name", "")
@@ -687,9 +811,13 @@ def reconstruct_from_posed_images(
                 poses = str(folder_candidate / "cubemap_poses.json")
                 if verbose:
                     print(f"[Auto-Route] Auto-detected cubemap poses JSON: {poses}")
+            elif (folder_candidate / "jobdata.json").is_file():
+                poses = str(folder_candidate / "jobdata.json")
+                if verbose:
+                    print(f"[Auto-Route] Auto-detected jobdata JSON: {poses}")
             else:
                 raise ValueError(
-                    f"No --poses provided, and could not find poses.npy, poses.json, or ARKit panorama pairs in: {folder_candidate}"
+                    f"No --poses provided, and could not find poses.npy, poses.json, jobdata.json, or ARKit panorama pairs in: {folder_candidate}"
                 )
 
     if poses is None:

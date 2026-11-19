@@ -158,6 +158,31 @@ def find_pano_json_pairs(
 
         record_map = {}
         if isinstance(content, list):
+            # Sort content by scanChain.index if available and resolve any terminal node whose arKitData is null
+            has_chain = any(isinstance(item, dict) and item.get("scanChain", {}).get("index") is not None for item in content)
+            if has_chain:
+                content = sorted(
+                    content,
+                    key=lambda x: x.get("scanChain", {}).get("index", 999999) if isinstance(x, dict) else 999999
+                )
+                # Resolve terminal node whose arKitData is null from the previous node's destination
+                for i, item in enumerate(content):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("arKitData") is None and i > 0 and isinstance(content[i - 1], dict) and content[i - 1].get("arKitData") is not None:
+                        prev_arkit = content[i - 1]["arKitData"]
+                        item["arKitData"] = {
+                            "origin": prev_arkit.get("destination"),
+                            "destination": None,
+                            "originPose": prev_arkit.get("destinationPose"),
+                            "destinationPose": None,
+                            "originHeading": prev_arkit.get("destinationHeading"),
+                            "destinationHeading": None,
+                            "distanceMeters": 0.0,
+                            "horizontalDistanceMeters": 0.0,
+                            "isTerminal": True,
+                        }
+
             for item in content:
                 if isinstance(item, dict):
                     jid = item.get("jobId") or item.get("id") or item.get("sessionId") or item.get("image_name")
@@ -242,30 +267,64 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
     elif isinstance(json_source, (str, Path)):
         source_name = str(json_source)
         with open(json_source, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_content = json.load(f)
+        if isinstance(raw_content, list) and len(raw_content) > 0:
+            data = raw_content[0]
+        elif isinstance(raw_content, dict):
+            data = raw_content
+        else:
+            raise ValueError(f"Unsupported content in {json_source}")
     else:
         raise ValueError(f"Unsupported json_source type: {type(json_source)}")
 
-    # Extract origin
+    # Extract origin: prioritize true global ARKit trajectory origin over local sphere placement
     origin = None
-    if "arkitCapture" in data and "sphere" in data["arkitCapture"]:
-        origin = data["arkitCapture"]["sphere"].get("origin")
-    elif "origin" in data:
-        origin = data["origin"]
-    elif "position" in data:
-        origin = data["position"]
+    arkit_data = data.get("arKitData")
+    if isinstance(arkit_data, dict):
+        if "origin" in arkit_data:
+            o = arkit_data["origin"]
+            if isinstance(o, dict):
+                origin = [float(o.get("x", 0.0)), float(o.get("y", 0.0)), float(o.get("z", 0.0))]
+            elif isinstance(o, (list, tuple)) and len(o) == 3:
+                origin = [float(v) for v in o]
+
+    if origin is None:
+        if "origin" in data and isinstance(data["origin"], (list, tuple)) and len(data["origin"]) == 3:
+            origin = [float(v) for v in data["origin"]]
+        elif "origin" in data and isinstance(data["origin"], dict):
+            o = data["origin"]
+            origin = [float(o.get("x", 0.0)), float(o.get("y", 0.0)), float(o.get("z", 0.0))]
+        elif "position" in data:
+            pos = data["position"]
+            if isinstance(pos, dict):
+                origin = [float(pos.get("x", 0.0)), float(pos.get("y", 0.0)), float(pos.get("z", 0.0))]
+            elif isinstance(pos, (list, tuple)) and len(pos) == 3:
+                origin = [float(v) for v in pos]
+        elif "arkitCapture" in data and "sphere" in data["arkitCapture"]:
+            origin = data["arkitCapture"]["sphere"].get("origin")
 
     if origin is None or len(origin) != 3:
         raise ValueError(f"Could not extract 3D origin [x, y, z] from {source_name}")
 
-    # Extract heading: check magneticHeading, headingAtPlace (nested or top-level), or heading
-    heading = data.get("magneticHeading")
+    # Extract heading: check arKitData originHeading, magneticHeading, headingAtPlace, or heading
+    heading = None
+    if isinstance(arkit_data, dict):
+        heading = arkit_data.get("originHeading")
+    if heading is None:
+        heading = data.get("magneticHeading")
     if heading is None and "arkitCapture" in data and "sphere" in data["arkitCapture"]:
         heading = data["arkitCapture"]["sphere"].get("headingAtPlace")
     if heading is None:
         heading = data.get("headingAtPlace")
     if heading is None:
         heading = data.get("heading", 0.0)
+
+    # Extract 4x4 ARKit pose matrix if available (column-major simd_float4x4)
+    c2w_arkit_4x4 = None
+    if isinstance(arkit_data, dict) and "originPose" in arkit_data:
+        raw_p = arkit_data["originPose"]
+        if isinstance(raw_p, (list, tuple)) and len(raw_p) == 16:
+            c2w_arkit_4x4 = np.array(raw_p, dtype=np.float32).reshape((4, 4), order="F")
 
     # Extract scanChain and heightAboveFloor if present
     scan_chain = data.get("scanChain", {}) if isinstance(data.get("scanChain"), dict) else {}
@@ -279,6 +338,7 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
         "raw": data,
         "origin_arkit": np.array(origin, dtype=np.float32),  # [X_east, Y_up, Z_south]
         "magnetic_heading_deg": float(heading),
+        "c2w_arkit_4x4": c2w_arkit_4x4,
         "job_id": data.get("jobId"),
         "scan_chain_index": chain_index,
         "chain_id": chain_id,
