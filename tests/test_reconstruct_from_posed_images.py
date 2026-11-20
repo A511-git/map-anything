@@ -143,6 +143,32 @@ def test_export_point_cloud():
         assert os.path.exists(pcd_path)
         assert os.path.getsize(pcd_path) > 0
 
+        # Test dense point cloud export (bypassing voxel_size)
+        dense_ply_path = os.path.join(tmpdir, "test_dense.ply")
+        export_point_cloud(dense_ply_path, points, colors, voxel_size=0.1, dense=True)
+        assert os.path.exists(dense_ply_path)
+        assert os.path.getsize(dense_ply_path) > 0
+
+
+def test_dense_flag_cli_parsing():
+    import argparse
+    from scripts.reconstruct_from_posed_images import main
+
+    # Test parser handling of --dense
+    from scripts.reconstruct_from_posed_images import reconstruct_from_posed_images
+    import unittest.mock as mock
+
+    test_args = ["reconstruct_from_posed_images.py", "--images", "dummy_dir", "--dense"]
+    with mock.patch("sys.argv", test_args):
+        with mock.patch("scripts.reconstruct_from_posed_images.reconstruct_from_posed_images") as mock_recon:
+            with mock.patch("scripts.reconstruct_from_posed_images.find_images", return_value=(["dummy.jpg"], ["dummy.jpg"])):
+                with mock.patch("scripts.reconstruct_from_posed_images.load_poses", return_value=[np.eye(4)]):
+                    main()
+                    assert mock_recon.called
+                    call_kwargs = mock_recon.call_args[1]
+                    assert call_kwargs["dense"] is True
+                    assert call_kwargs["voxel_size"] is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

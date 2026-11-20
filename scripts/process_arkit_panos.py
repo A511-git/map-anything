@@ -893,6 +893,14 @@ def main():
         default=0.01,
         help="Voxel downsample size in meters for reconstruction (default: 0.01).",
     )
+    parser.add_argument(
+        "--dense",
+        "--full_dense",
+        dest="dense",
+        action="store_true",
+        default=False,
+        help="Export full dense point cloud without voxel downsampling (bypasses --voxel_size).",
+    )
 
     args = parser.parse_args()
 
@@ -922,7 +930,8 @@ def main():
             poses=results["poses_npy"],
             intrinsics=results["intrinsics_npy"],
             output_path=recon_out,
-            voxel_size=args.voxel_size,
+            voxel_size=None if args.dense else args.voxel_size,
+            dense=args.dense,
             use_multiview_confidence=True,
         )
 

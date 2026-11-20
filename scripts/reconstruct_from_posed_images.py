@@ -13,10 +13,17 @@ Supports:
 - Pose convention conversion (OpenGL/Blender RUB -> OpenCV RDF, COLMAP world2cam -> cam2world)
 - Optional camera intrinsics for sharper, planar, distortion-free geometry
 - Multi-view depth consistency filtering and max-depth clipping
-- Output export to .ply or .pcd with optional voxel downsampling
+- Output export to .ply or .pcd with optional voxel downsampling or full dense point cloud (--dense)
 
 Usage Examples:
-    # Basic reconstruction from image folder and poses.npy:
+    # Full dense point cloud reconstruction (no voxel downsampling):
+    python scripts/reconstruct_from_posed_images.py \\
+        --images path/to/images/ \\
+        --poses path/to/poses.npy \\
+        --output output/combined.ply \\
+        --dense
+
+    # Basic reconstruction from image folder and poses.npy (with downsampling):
     python scripts/reconstruct_from_posed_images.py \\
         --images path/to/images/ \\
         --poses path/to/poses.npy \\
@@ -626,6 +633,7 @@ def export_point_cloud(
     colors: np.ndarray,
     voxel_size: Optional[float] = None,
     camera_markers: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    dense: bool = False,
 ) -> None:
     """
     Save point cloud to .ply or .pcd format with optional voxel downsampling.
@@ -635,10 +643,16 @@ def export_point_cloud(
         points: (N, 3) float32 coordinates
         colors: (N, 3) uint8 RGB colors [0, 255]
         voxel_size: Optional voxel grid downsample size in meters
+        camera_markers: Optional tuple of (marker_points, marker_colors)
+        dense: If True, exports the full dense point cloud without voxel downsampling
     """
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
+    if dense:
+        voxel_size = None
+        print(f"Full dense point cloud mode enabled: preserving all {len(points):,} points without downsampling.")
 
     # Optional voxel downsampling
     if voxel_size is not None and voxel_size > 0:
@@ -996,6 +1010,7 @@ def reconstruct_from_posed_images(
     device: Optional[str] = None,
     output_path: Optional[str] = None,
     voxel_size: Optional[float] = None,
+    dense: bool = False,
     max_depth: Optional[float] = None,
     apply_mask: bool = True,
     mask_edges: bool = True,
@@ -1026,7 +1041,13 @@ def reconstruct_from_posed_images(
     - Auto-detecting raw ARKit equirectangular panoramas and auto-splitting them into perspective views
     - Auto-detecting poses.npy / poses.json and intrinsics.npy inside the input image folder
     - Exact metric cam2world camera poses in OpenCV RDF format
+    - Full dense point cloud preservation with dense=True (disables voxel downsampling)
     """
+    if dense:
+        voxel_size = None
+        if verbose:
+            print("[Point Cloud] Full dense point cloud mode enabled: voxel downsampling disabled.")
+
     # 0. Resolve smart output path (e.g. kaggle/working/output/AR_KIT/pointcloud.ply)
     resolved_output_path, target_output_dir = resolve_output_pointcloud_path(
         output_path, images, default_filename="pointcloud.ply"
@@ -1368,6 +1389,7 @@ def reconstruct_from_posed_images(
             colors=combined_colors,
             voxel_size=voxel_size,
             camera_markers=camera_markers_tuple,
+            dense=dense,
         )
 
     return combined_points, combined_colors
@@ -1472,6 +1494,29 @@ def main():
         help="Optional voxel downsampling grid size in meters (e.g. 0.01 for 1cm grid)",
     )
     parser.add_argument(
+        "--dense",
+        "--full_dense",
+        "--no_downsample",
+        dest="dense",
+        action="store_true",
+        default=False,
+        help="Export full dense point cloud without voxel downsampling (bypasses and disables --voxel_size).",
+    )
+    parser.add_argument(
+        "--no_mask",
+        dest="apply_mask",
+        action="store_false",
+        default=True,
+        help="Do not apply network validity mask (keeps all predicted points).",
+    )
+    parser.add_argument(
+        "--no_mask_edges",
+        dest="mask_edges",
+        action="store_false",
+        default=True,
+        help="Do not filter edge artifacts using depth and normals.",
+    )
+    parser.add_argument(
         "--max_depth",
         type=float,
         default=None,
@@ -1565,6 +1610,9 @@ def main():
 
     model_name = "facebook/map-anything-apache" if args.apache else "facebook/map-anything"
 
+    if args.dense:
+        args.voxel_size = None
+
     reconstruct_from_posed_images(
         images=images_input,
         poses=args.poses,
@@ -1577,7 +1625,10 @@ def main():
         device=args.device,
         output_path=args.output,
         voxel_size=args.voxel_size,
+        dense=args.dense,
         max_depth=args.max_depth,
+        apply_mask=args.apply_mask,
+        mask_edges=args.mask_edges,
         use_multiview_confidence=args.use_multiview_confidence,
         apply_confidence_mask=args.apply_confidence_mask,
         confidence_percentile=args.confidence_percentile,
