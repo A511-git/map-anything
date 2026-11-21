@@ -460,10 +460,6 @@ def compute_level1_normalized_poses(
             delta_arkit[2],      # South -> +Z
         ], dtype=np.float32)
 
-        # Rotate horizontal translation into Anchor's reference frame (around +Y Up by -h0_deg)
-        R_world_to_anchor = rotation_matrix_y(-h0_deg)
-        t_pano = R_world_to_anchor @ delta_world
-
         # Relative heading delta with optional lens offset
         delta_h = (h_deg - h0_deg + pano_yaw_offset) % 360.0
         rad_rel = np.radians(delta_h)
@@ -475,6 +471,17 @@ def compute_level1_normalized_poses(
             [sin_rel, 0.0, cos_rel],
         ], dtype=np.float32)
         R_pano = R_rot @ R_base
+
+        # Scene alignment: Rotate ARKit longitudinal corridor (+Z_arkit) into camera corridor (-X_world)
+        # using canonical unitary SO(3) rotation R_scene = R_Y(+90 deg)
+        R_scene = np.array([
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0,  0.0],
+            [1.0, 0.0,  0.0]
+        ], dtype=np.float32)
+
+        t_pano = R_scene @ delta_world
+        R_pano = R_scene @ R_pano
 
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R_pano
