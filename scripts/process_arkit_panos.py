@@ -289,7 +289,9 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
                 origin = [float(v) for v in o]
 
     if origin is None:
-        if "origin" in data and isinstance(data["origin"], (list, tuple)) and len(data["origin"]) == 3:
+        if "origin_arkit_xyz" in data and isinstance(data["origin_arkit_xyz"], (list, tuple)) and len(data["origin_arkit_xyz"]) == 3:
+            origin = [float(v) for v in data["origin_arkit_xyz"]]
+        elif "origin" in data and isinstance(data["origin"], (list, tuple)) and len(data["origin"]) == 3:
             origin = [float(v) for v in data["origin"]]
         elif "origin" in data and isinstance(data["origin"], dict):
             o = data["origin"]
@@ -309,7 +311,9 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
     # Extract heading: check arKitData originHeading, magneticHeading, headingAtPlace, or heading
     heading = None
     if isinstance(arkit_data, dict):
-        heading = arkit_data.get("originHeading")
+        heading = arKitData.get("originHeading") if (arkit_data is not None and "originHeading" in arkit_data) else None
+    if heading is None:
+        heading = data.get("magnetic_heading_deg")
     if heading is None:
         heading = data.get("magneticHeading")
     if heading is None and "arkitCapture" in data and "sphere" in data["arkitCapture"]:
@@ -405,20 +409,22 @@ def resolve_anchor_index(anchor_spec: Union[int, str, None], pano_records: List[
 
 def compute_level1_normalized_poses(
     pano_records: List[dict],
-    heading_mode: str = "north_aligned",
     anchor_index: int = 0,
+    pano_yaw_offset: float = 0.0,
 ) -> List[dict]:
     """
-    Level 1 Normalization:
-    Transforms ARKit world coordinates (+X East, +Y Up, +Z South) to OpenCV RDF
-    cam2world poses, setting the anchor panorama at the origin [0, 0, 0]
-    facing forward (+Z).
+    Unified Level 1 Normalization:
+    Transforms ARKit world coordinates (+X East, +Y Up, +Z South) into OpenCV RDF
+    cam2world poses in a true Y-Up right-handed world frame, setting the anchor
+    panorama at the origin [0, 0, 0] with canonical base orientation R_base = diag([1, -1, -1]).
+    
+    Elevation (+Y Up) is preserved as strictly positive upwards. Horizontal translations
+    and rotations are rigidly coupled via SE(3) transformation relative to Anchor Station.
     
     Args:
         pano_records: List of dicts with 'image_path', 'json_path', 'origin_arkit', 'magnetic_heading_deg'
-        heading_mode: 'north_aligned' (default, panoramas already stitched facing north),
-                      'relative' (applies magneticHeading difference), or 'raw_compass'
         anchor_index: Index of the anchor panorama (default: 0)
+        pano_yaw_offset: Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0)
     
     Returns:
         Updated list of dicts with 'c2w_pano_4x4', 't_pano_relative', 'R_pano_relative'
@@ -432,40 +438,50 @@ def compute_level1_normalized_poses(
     p0_arkit = pano_records[anchor_index]["origin_arkit"]
     h0_deg = pano_records[anchor_index]["magnetic_heading_deg"]
 
+    # Base orientation for OpenCV RDF camera in Y-Up World (facing North):
+    # Camera +X (Right) -> World +X (East)
+    # Camera +Y (Down) -> World -Y (Down)
+    # Camera +Z (Forward) -> World -Z (North)
+    # Proper rotation in SO(3): det(R_base) = +1.0
+    R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
     normalized = []
     for idx, rec in enumerate(pano_records):
         p_arkit = rec["origin_arkit"]
         h_deg = rec["magnetic_heading_deg"]
 
         # Relative translation vector in ARKit coordinates (in meters)
+        # ARKit world coordinates: +X East, +Y UP, +Z South
         delta_arkit = p_arkit - p0_arkit  # [delta_X (east), delta_Y (up), delta_Z (south)]
 
-        # Convert to OpenCV Cardinal-North world (+X right/east, +Y down, +Z forward/north)
-        delta_cv = np.array([
+        delta_world = np.array([
             delta_arkit[0],      # East -> +X
-            -delta_arkit[1],     # Up -> Down (-Y)
-            -delta_arkit[2],     # South -> North (+Z)
+            delta_arkit[1],      # Up -> +Y (elevation preserved as positive!)
+            delta_arkit[2],      # South -> +Z
         ], dtype=np.float32)
 
-        if heading_mode == "relative":
-            # Relative heading delta
-            delta_h = (h_deg - h0_deg) % 360.0
-            R_pano = rotation_matrix_y(delta_h)
-            # Rotate translation into Anchor's reference frame (so Anchor faces +Z)
-            R_world_to_anchor = rotation_matrix_y(-h0_deg)
-            t_pano = R_world_to_anchor @ delta_cv
+        # Rotate horizontal translation into Anchor's reference frame (around +Y Up)
+        rad0 = np.radians(-h0_deg)
+        cos0 = np.cos(rad0)
+        sin0 = np.sin(rad0)
+        R_world_to_anchor = np.array([
+            [cos0, 0.0, -sin0],
+            [0.0, 1.0, 0.0],
+            [sin0, 0.0, cos0],
+        ], dtype=np.float32)
+        t_pano = R_world_to_anchor @ delta_world
 
-        elif heading_mode == "north_aligned":
-            # Assumes equirectangular center is already aligned to North for all panos
-            R_pano = np.eye(3, dtype=np.float32)
-            t_pano = delta_cv
-
-        elif heading_mode == "raw_compass":
-            # Keep absolute compass rotation in OpenCV frame
-            R_pano = rotation_matrix_y(h_deg)
-            t_pano = delta_cv
-        else:
-            raise ValueError(f"Unknown heading_mode: {heading_mode}. Valid: ['relative', 'north_aligned', 'raw_compass']")
+        # Relative heading delta with optional lens offset
+        delta_h = (h_deg - h0_deg + pano_yaw_offset) % 360.0
+        rad_rel = np.radians(delta_h)
+        cos_rel = np.cos(rad_rel)
+        sin_rel = np.sin(rad_rel)
+        R_rot = np.array([
+            [cos_rel, 0.0, -sin_rel],
+            [0.0, 1.0, 0.0],
+            [sin_rel, 0.0, cos_rel],
+        ], dtype=np.float32)
+        R_pano = R_rot @ R_base
 
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R_pano
@@ -610,17 +626,18 @@ def process_arkit_panoramas(
     split_mode: str = "ring12",
     face_size: int = 1024,
     fov_deg: float = 90.0,
-    heading_mode: str = "north_aligned",
     anchor: Union[int, str] = 0,
+    pano_yaw_offset: float = 0.0,
     jpeg_quality: int = 95,
     verbose: bool = True,
 ) -> Dict[str, Union[int, str, List[dict]]]:
     """
     Main processing routine for ARKit panoramas:
     1. Discovers and pairs images and JSONs.
-    2. Performs Level 1 normalization (anchoring designated Pano at origin).
+    2. Performs Unified Level 1 normalization in Y-Up right-handed world coordinates
+       (anchoring designated Pano at origin [0, 0, 0] with canonical orientation).
     3. Performs Level 2 perspective splitting and pose calculation.
-    4. Saves images, poses.npy, intrinsics.npy, and JSON metadata.
+    4. Saves images, poses.npy, intrinsics.npy, and JSON metadata with explicit coordinate documentation.
     """
     input_path = Path(input_dir)
     output_path = resolve_output_dir(output_dir, input_path)
@@ -650,8 +667,8 @@ def process_arkit_panoramas(
     # Resolve anchor
     anchor_idx = resolve_anchor_index(anchor, records)
 
-    # 2. Level 1 Normalization
-    normalized_panos = compute_level1_normalized_poses(records, heading_mode=heading_mode, anchor_index=anchor_idx)
+    # 2. Level 1 Normalization (Unified Y-Up SE(3) anchor frame)
+    normalized_panos = compute_level1_normalized_poses(records, anchor_index=anchor_idx, pano_yaw_offset=pano_yaw_offset)
 
     if verbose:
         print(f"\n--- Level 1 Normalization (Anchor: Pano [{anchor_idx}] {records[anchor_idx]['image_path'].name}) ---")
@@ -664,6 +681,18 @@ def process_arkit_panoramas(
             print(f"  Position: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m{tag}")
             print(f"  Heading:  {h:.1f}°")
 
+    coord_system_doc = {
+        "world_convention": "Y-Up Right-Handed (Standard Robotics / ARKit / Blender / Three.js)",
+        "axes_explanation": {
+            "+X": "Horizontal Right / East (transversal axis, units: meters, positive = right/east)",
+            "+Y": "Vertical Up / Elevation (gravitational axis, units: meters, positive = up toward ceiling, negative = down toward floor)",
+            "+Z": "Horizontal South (longitudinal axis, units: meters, positive = south, negative = north/forward)",
+        },
+        "camera_convention": "OpenCV RDF (+X Right, +Y Down, +Z Optical Axis Forward in meters)",
+        "anchor_station": f"Station {anchor_idx} ({records[anchor_idx]['image_path'].name}) anchored at origin [0, 0, 0] with canonical orientation",
+        "units": "meters",
+    }
+
     # Save Level 1 normalized metadata
     level1_meta_file = output_path / "normalized_arkit_metadata.json"
     level1_export = []
@@ -675,6 +704,7 @@ def process_arkit_panoramas(
             "scan_chain_index": p.get("scan_chain_index"),
             "height_above_floor": p.get("height_above_floor"),
             "is_anchor": p.get("is_anchor", False),
+            "coordinate_system": coord_system_doc,
             "origin_arkit_xyz": p["origin_arkit"].tolist(),
             "magnetic_heading_deg": p["magnetic_heading_deg"],
             "relative_position_xyz": p["t_pano_relative"].tolist(),
@@ -794,9 +824,32 @@ def process_arkit_panoramas(
 
     json_export = []
     for v in extracted_views:
+        R_mat = np.array(v["cam2world_pose_4x4"])[:3, :3]
         json_export.append({
             "image_name": v["image_name"],
+            "parent_pano": v["parent_pano"],
+            "face_name": v["face_name"],
+            "yaw_deg": v["yaw_deg"],
+            "pitch_deg": v["pitch_deg"],
+            "coordinate_system": coord_system_doc,
             "camera_position_xyz": v["camera_position_xyz"],
+            "axes_directions_in_world": {
+                "camera_right_+X_axis": [
+                    round(float(R_mat[0, 0]), 6),
+                    round(float(R_mat[1, 0]), 6),
+                    round(float(R_mat[2, 0]), 6),
+                ],
+                "camera_down_+Y_axis": [
+                    round(float(R_mat[0, 1]), 6),
+                    round(float(R_mat[1, 1]), 6),
+                    round(float(R_mat[2, 1]), 6),
+                ],
+                "optical_axis_forward_+Z": [
+                    round(float(R_mat[0, 2]), 6),
+                    round(float(R_mat[1, 2]), 6),
+                    round(float(R_mat[2, 2]), 6),
+                ],
+            },
             "extrinsic_matrix_3x4": v["extrinsic_matrix_3x4"],
             "cam2world_pose_4x4": v["cam2world_pose_4x4"],
         })
@@ -870,11 +923,10 @@ def main():
         help="Field of view in degrees for each perspective view (default: 90.0).",
     )
     parser.add_argument(
-        "--heading_mode",
-        type=str,
-        default="north_aligned",
-        choices=["north_aligned", "relative", "raw_compass"],
-        help="Heading alignment mode: 'north_aligned' (default: panos already stitched yaw0=North), 'relative' (delta magnetic heading), or 'raw_compass'.",
+        "--pano_yaw_offset",
+        type=float,
+        default=0.0,
+        help="Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
         "--run_reconstruction",
@@ -910,7 +962,7 @@ def main():
         split_mode=args.split_mode,
         face_size=args.face_size,
         fov_deg=args.fov,
-        heading_mode=args.heading_mode,
+        pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
     )
 

@@ -71,11 +71,10 @@ def main():
         help="Field of view in degrees for each perspective view (default: 90.0).",
     )
     parser.add_argument(
-        "--heading_mode",
-        type=str,
-        default="north_aligned",
-        choices=["north_aligned", "relative", "raw_compass"],
-        help="Heading alignment mode: 'north_aligned' (default), 'relative', or 'raw_compass'.",
+        "--pano_yaw_offset",
+        type=float,
+        default=0.0,
+        help="Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
         "--run_reconstruction",
@@ -103,7 +102,7 @@ def main():
         split_mode="cubemap",
         face_size=args.face_size,
         fov_deg=args.fov,
-        heading_mode=args.heading_mode,
+        pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
     )
 

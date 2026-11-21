@@ -70,12 +70,13 @@ def test_level1_normalization_math():
         },
     ]
 
-    normalized = compute_level1_normalized_poses(records, heading_mode="relative")
+    normalized = compute_level1_normalized_poses(records)
     assert len(normalized) == 2
 
-    # Pano 0 must be identity at origin
+    # Pano 0 must be centered at origin with base orientation in Y-Up ARKit world
     c2w_0 = normalized[0]["c2w_pano_4x4"]
-    np.testing.assert_allclose(c2w_0[:3, :3], np.eye(3), atol=1e-6)
+    R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    np.testing.assert_allclose(c2w_0[:3, :3], R_base, atol=1e-6)
     np.testing.assert_allclose(c2w_0[:3, 3], np.zeros(3), atol=1e-6)
     assert normalized[0]["euclidean_dist_from_anchor"] == 0.0
 
@@ -89,10 +90,16 @@ def test_level1_normalization_math():
     # Relative heading rotation: 78.48 - 223.79 = -145.31 deg = 214.69 deg
     delta_h = (78.48435 - 223.79487) % 360.0
     R1 = normalized[1]["R_pano_relative"]
-    np.testing.assert_allclose(R1, rotation_matrix_y(delta_h), atol=1e-5)
+    rad_rel = np.radians(delta_h)
+    R_rot = np.array([
+        [np.cos(rad_rel), 0.0, -np.sin(rad_rel)],
+        [0.0, 1.0, 0.0],
+        [np.sin(rad_rel), 0.0, np.cos(rad_rel)],
+    ], dtype=np.float32)
+    np.testing.assert_allclose(R1, R_rot @ R_base, atol=1e-5)
 
 
-def test_heading_modes():
+def test_unified_normalization_and_yaw_offset():
     records = [
         {
             "origin_arkit": np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -101,24 +108,28 @@ def test_heading_modes():
             "json_path": Path("pano_0.json"),
         },
         {
-            "origin_arkit": np.array([1.0, 0.0, 2.0], dtype=np.float32),
+            "origin_arkit": np.array([1.0, 0.5, 2.0], dtype=np.float32),
             "magnetic_heading_deg": 90.0,
             "image_path": Path("pano_1.jpg"),
             "json_path": Path("pano_1.json"),
         },
     ]
 
-    # Test north_aligned mode: all rotations identity
-    norm_north = compute_level1_normalized_poses(records, heading_mode="north_aligned")
-    np.testing.assert_allclose(norm_north[0]["R_pano_relative"], np.eye(3))
-    np.testing.assert_allclose(norm_north[1]["R_pano_relative"], np.eye(3))
-    # In north aligned: cv coords delta = [1.0, -0.0, -2.0]
-    np.testing.assert_allclose(norm_north[1]["t_pano_relative"], [1.0, 0.0, -2.0])
+    R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
 
-    # Test raw_compass mode
-    norm_compass = compute_level1_normalized_poses(records, heading_mode="raw_compass")
-    np.testing.assert_allclose(norm_compass[0]["R_pano_relative"], rotation_matrix_y(45.0), atol=1e-5)
-    np.testing.assert_allclose(norm_compass[1]["R_pano_relative"], rotation_matrix_y(90.0), atol=1e-5)
+    # Standard unified normalization:
+    norm = compute_level1_normalized_poses(records)
+    np.testing.assert_allclose(norm[0]["R_pano_relative"], R_base)
+    # Elevation (+Y) is strictly preserved: delta Y = 0.5m
+    assert pytest.approx(norm[1]["t_pano_relative"][1], abs=1e-5) == 0.5
+    # Distance is preserved (1^2 + 0.5^2 + 2^2 = 5.25, sqrt = 2.291)
+    dist = float(np.linalg.norm(norm[1]["t_pano_relative"]))
+    assert pytest.approx(dist, rel=1e-5) == np.sqrt(5.25)
+
+    # Test with 180 degree yaw offset
+    norm_offset = compute_level1_normalized_poses(records, pano_yaw_offset=180.0)
+    assert norm_offset[1]["R_pano_relative"].shape == (3, 3)
+    np.testing.assert_allclose(norm_offset[0]["t_pano_relative"], [0, 0, 0])
 
 
 def test_level2_perspective_face_definitions():
@@ -445,8 +456,8 @@ def test_mathematical_consistency_and_spatial_alignment():
             },
         ]
 
-    for heading_mode in ["north_aligned", "relative"]:
-        normalized_panos = compute_level1_normalized_poses(records, heading_mode=heading_mode, anchor_index=0)
+    for yaw_offset in [0.0, 180.0]:
+        normalized_panos = compute_level1_normalized_poses(records, anchor_index=0, pano_yaw_offset=yaw_offset)
         face_defs = get_cubemap_faces_definitions()
 
         # Build face poses for all stations
@@ -483,15 +494,14 @@ def test_mathematical_consistency_and_spatial_alignment():
                     f"Isometry violated between pano {i} and {j}: world={d_world}, arkit={d_arkit}"
                 )
 
-        # --- Invariant 2: Altitude Invariance (Gravity Alignment) in north_aligned mode ---
-        if heading_mode == "north_aligned":
-            for i in range(len(normalized_panos)):
-                for j in range(i + 1, len(normalized_panos)):
-                    delta_y_arkit = float(normalized_panos[j]["origin_arkit"][1] - normalized_panos[i]["origin_arkit"][1])
-                    delta_y_world = float(-(normalized_panos[j]["t_pano_relative"][1] - normalized_panos[i]["t_pano_relative"][1]))
-                    assert pytest.approx(delta_y_world, rel=1e-5, abs=1e-5) == delta_y_arkit, (
-                        f"Elevation delta mismatch between pano {i} and {j}"
-                    )
+        # --- Invariant 2: Altitude Invariance (Elevation Uprightness in Y-Up World) ---
+        for i in range(len(normalized_panos)):
+            for j in range(i + 1, len(normalized_panos)):
+                delta_y_arkit = float(normalized_panos[j]["origin_arkit"][1] - normalized_panos[i]["origin_arkit"][1])
+                delta_y_world = float(normalized_panos[j]["t_pano_relative"][1] - normalized_panos[i]["t_pano_relative"][1])
+                assert pytest.approx(delta_y_world, rel=1e-5, abs=1e-5) == delta_y_arkit, (
+                    f"Elevation delta mismatch between pano {i} and {j}: world={delta_y_world}, arkit={delta_y_arkit}"
+                )
 
         # --- Invariant 3: SO(3) Orthonormality and Right-Handedness ---
         for f in all_face_records:

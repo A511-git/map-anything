@@ -97,19 +97,21 @@ def test_anchor_level1_normalization():
         {"origin_arkit": np.array([3.0, 0.0, 4.0], dtype=np.float32), "magnetic_heading_deg": 90.0, "image_path": Path("B.jpg"), "json_path": Path("B.json")},
     ]
 
+    R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
     # Anchor at 0: A is origin
-    norm0 = compute_level1_normalized_poses(records, heading_mode="relative", anchor_index=0)
+    norm0 = compute_level1_normalized_poses(records, anchor_index=0)
     assert norm0[0]["is_anchor"] is True
     assert norm0[1]["is_anchor"] is False
     np.testing.assert_allclose(norm0[0]["t_pano_relative"], [0, 0, 0])
-    np.testing.assert_allclose(norm0[0]["R_pano_relative"], np.eye(3))
+    np.testing.assert_allclose(norm0[0]["R_pano_relative"], R_base)
 
     # Anchor at 1: B is origin
-    norm1 = compute_level1_normalized_poses(records, heading_mode="relative", anchor_index=1)
+    norm1 = compute_level1_normalized_poses(records, anchor_index=1)
     assert norm1[1]["is_anchor"] is True
     assert norm1[0]["is_anchor"] is False
     np.testing.assert_allclose(norm1[1]["t_pano_relative"], [0, 0, 0])
-    np.testing.assert_allclose(norm1[1]["R_pano_relative"], np.eye(3))
+    np.testing.assert_allclose(norm1[1]["R_pano_relative"], R_base)
 
 
 def test_reconstruct_from_posed_images_auto_detect_arkit(sample_arkit_dir):

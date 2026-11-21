@@ -316,6 +316,9 @@ def load_poses(
         elif suffix == ".json":
             with open(path, "r", encoding="utf-8") as f:
                 content = json.load(f)
+            # Support top-level dict wrapper with "poses" key and coordinate_system metadata
+            if isinstance(content, dict) and "poses" in content:
+                content = content["poses"]
             if isinstance(content, list):
                 if len(content) > 0 and isinstance(content[0], dict):
                     # Check if this is an ARKit jobdata scan chain (containing jobId, scanChain, or arKitData)
@@ -1026,7 +1029,7 @@ def reconstruct_from_posed_images(
     face_size: int = 1024,
     fov_deg: float = 90.0,
     anchor: Union[int, str] = 0,
-    heading_mode: str = "north_aligned",
+    pano_yaw_offset: float = 0.0,
     cache_dir: Optional[Union[str, Path]] = None,
     # Camera visualization options:
     add_camera_markers: bool = True,
@@ -1083,7 +1086,7 @@ def reconstruct_from_posed_images(
                 split_mode=split_mode,
                 face_size=face_size,
                 fov_deg=fov_deg,
-                heading_mode=heading_mode,
+                pano_yaw_offset=pano_yaw_offset,
                 anchor=anchor,
                 verbose=verbose,
             )
@@ -1443,11 +1446,10 @@ def main():
         help="If --images contains raw panos, anchor panorama index or filename (default: 0).",
     )
     parser.add_argument(
-        "--heading_mode",
-        type=str,
-        default="north_aligned",
-        choices=["north_aligned", "relative", "raw_compass"],
-        help="If --images contains raw panos, heading alignment mode (default: 'north_aligned').",
+        "--pano_yaw_offset",
+        type=float,
+        default=0.0,
+        help="If --images contains raw panos, horizontal yaw offset in degrees (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
         "--cache_dir",
@@ -1639,7 +1641,7 @@ def main():
         face_size=args.face_size,
         fov_deg=args.fov,
         anchor=args.anchor,
-        heading_mode=args.heading_mode,
+        pano_yaw_offset=args.pano_yaw_offset,
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,
         marker_radius=args.marker_radius,
