@@ -174,6 +174,31 @@ def test_direct_arkit_poses_no_normalize():
         np.testing.assert_allclose(np.linalg.det(R), 1.0, atol=1e-5)
 
 
+def test_load_arkit_metadata_sphere_offset():
+    """Test that include_sphere_offset incorporates capture sphere horizontal displacement."""
+    raw_data = {
+        "jobId": "test_station",
+        "arKitData": {
+            "origin": {"x": -5.0, "y": -1.0, "z": 7.0},
+            "originHeading": 90.0,
+        },
+        "arkitCapture": {
+            "sphere": {
+                "origin": [-0.15, 1.45, 0.20],
+                "heightAboveFloor": 1.45,
+            }
+        }
+    }
+    # Without sphere offset
+    meta_without = load_arkit_metadata(raw_data, include_sphere_offset=False)
+    np.testing.assert_allclose(meta_without["origin_arkit"], [-5.0, -1.0, 7.0])
+    assert meta_without["sphere_offset"] == [-0.15, 1.45, 0.20]
+
+    # With sphere offset
+    meta_with = load_arkit_metadata(raw_data, include_sphere_offset=True)
+    np.testing.assert_allclose(meta_with["origin_arkit"], [-5.15, -1.0, 7.20])
+
+
 def test_level2_perspective_face_definitions():
     cubemap_faces = get_cubemap_faces_definitions()
     assert len(cubemap_faces) == 6

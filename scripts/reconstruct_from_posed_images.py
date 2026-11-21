@@ -1031,6 +1031,7 @@ def reconstruct_from_posed_images(
     anchor: Union[int, str] = 0,
     pano_yaw_offset: float = 0.0,
     no_normalize: bool = False,
+    include_sphere_offset: bool = False,
     cache_dir: Optional[Union[str, Path]] = None,
     # Camera visualization options:
     add_camera_markers: bool = True,
@@ -1090,6 +1091,7 @@ def reconstruct_from_posed_images(
                 pano_yaw_offset=pano_yaw_offset,
                 anchor=anchor,
                 no_normalize=no_normalize,
+                include_sphere_offset=include_sphere_offset,
                 verbose=verbose,
             )
             pano_res = res
@@ -1461,6 +1463,13 @@ def main():
         help="If --images contains raw panos, use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
     )
     parser.add_argument(
+        "--include_sphere_offset", "--include-sphere-offset",
+        dest="include_sphere_offset",
+        action="store_true",
+        default=False,
+        help="If --images contains raw panos, include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -1652,6 +1661,7 @@ def main():
         anchor=args.anchor,
         pano_yaw_offset=args.pano_yaw_offset,
         no_normalize=args.no_normalize,
+        include_sphere_offset=args.include_sphere_offset,
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,
         marker_radius=args.marker_radius,

@@ -92,6 +92,13 @@ def main():
         help="Use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
     )
     parser.add_argument(
+        "--include_sphere_offset", "--include-sphere-offset",
+        dest="include_sphere_offset",
+        action="store_true",
+        default=False,
+        help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically trigger MapAnything 3D reconstruction after extracting perspective views.",
@@ -130,6 +137,7 @@ def main():
         pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
         no_normalize=args.no_normalize,
+        include_sphere_offset=args.include_sphere_offset,
     )
 
     if args.run_reconstruction:

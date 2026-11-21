@@ -252,7 +252,10 @@ def find_pano_json_pairs(
     raise ValueError(f"No valid panorama image + ARKit JSON pairs found in {input_dir}")
 
 
-def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
+def load_arkit_metadata(
+    json_source: Union[str, Path, dict],
+    include_sphere_offset: bool = False,
+) -> dict:
     """
     Load and parse ARKit JSON capture metadata from a file path or a dictionary.
     
@@ -308,6 +311,20 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
     if origin is None or len(origin) != 3:
         raise ValueError(f"Could not extract 3D origin [x, y, z] from {source_name}")
 
+    # Extract sphere offset if present
+    sphere_offset = None
+    if "arkitCapture" in data and "sphere" in data["arkitCapture"]:
+        sph_orig = data["arkitCapture"]["sphere"].get("origin")
+        if sph_orig and isinstance(sph_orig, (list, tuple)) and len(sph_orig) == 3:
+            sphere_offset = [float(v) for v in sph_orig]
+            if include_sphere_offset:
+                # Apply horizontal lens offset [dx, 0, dz] to station origin
+                origin = [
+                    origin[0] + sphere_offset[0],
+                    origin[1],
+                    origin[2] + sphere_offset[2],
+                ]
+
     # Extract heading: check arKitData originHeading, magneticHeading, headingAtPlace, or heading
     heading = None
     if isinstance(arkit_data, dict):
@@ -347,6 +364,7 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
         "scan_chain_index": chain_index,
         "chain_id": chain_id,
         "height_above_floor": float(height_above_floor) if height_above_floor is not None else None,
+        "sphere_offset": sphere_offset,
     }
 
 
@@ -362,6 +380,21 @@ def rotation_matrix_y(angle_deg: float) -> np.ndarray:
         [cos_a, 0.0, sin_a],
         [0.0, 1.0, 0.0],
         [-sin_a, 0.0, cos_a],
+    ], dtype=np.float32)
+
+
+def rotation_matrix_y_world(angle_deg: float) -> np.ndarray:
+    """
+    3x3 rotation matrix for rotation around vertical +Y Up axis in Y-Up Right-Handed World (+X East, +Y Up, +Z South).
+    Clockwise rotation by angle_deg (matching compass heading from North [-Z] towards East [+X]).
+    """
+    rad = np.radians(angle_deg)
+    cos_a = np.cos(rad)
+    sin_a = np.sin(rad)
+    return np.array([
+        [cos_a, 0.0, -sin_a],
+        [0.0, 1.0, 0.0],
+        [sin_a, 0.0, cos_a],
     ], dtype=np.float32)
 
 
@@ -454,23 +487,11 @@ def compute_level1_normalized_poses(
                 R_arkit = c2w_arkit[:3, :3]
                 R_pano = R_arkit @ R_base
                 if pano_yaw_offset != 0.0:
-                    rad_off = np.radians(pano_yaw_offset)
-                    c_off, s_off = np.cos(rad_off), np.sin(rad_off)
-                    R_yaw_off = np.array([
-                        [c_off, 0.0, -s_off],
-                        [0.0, 1.0, 0.0],
-                        [s_off, 0.0, c_off],
-                    ], dtype=np.float32)
+                    R_yaw_off = rotation_matrix_y_world(pano_yaw_offset)
                     R_pano = R_pano @ R_yaw_off
             else:
                 h_eff = (h_deg + pano_yaw_offset) % 360.0
-                rad_h = np.radians(h_eff)
-                c_h, s_h = np.cos(rad_h), np.sin(rad_h)
-                R_yaw = np.array([
-                    [c_h, 0.0, -s_h],
-                    [0.0, 1.0, 0.0],
-                    [s_h, 0.0, c_h],
-                ], dtype=np.float32)
+                R_yaw = rotation_matrix_y_world(h_eff)
                 R_pano = R_yaw @ R_base
 
             c2w = np.eye(4, dtype=np.float32)
@@ -498,18 +519,11 @@ def compute_level1_normalized_poses(
 
         # Relative heading delta with optional lens offset
         delta_h = (h_deg - h0_deg + pano_yaw_offset) % 360.0
-        rad_rel = np.radians(delta_h)
-        cos_rel = np.cos(rad_rel)
-        sin_rel = np.sin(rad_rel)
-        R_rot = np.array([
-            [cos_rel, 0.0, -sin_rel],
-            [0.0, 1.0, 0.0],
-            [sin_rel, 0.0, cos_rel],
-        ], dtype=np.float32)
+        R_rot = rotation_matrix_y_world(delta_h)
         R_pano = R_rot @ R_base
 
         # Rotate horizontal translation into Anchor's reference frame (around +Y Up by -h0_deg)
-        R_world_to_anchor = rotation_matrix_y(-h0_deg)
+        R_world_to_anchor = rotation_matrix_y_world(-h0_deg)
         t_pano = R_world_to_anchor @ delta_world
 
         c2w = np.eye(4, dtype=np.float32)
@@ -658,6 +672,7 @@ def process_arkit_panoramas(
     anchor: Union[int, str] = 0,
     pano_yaw_offset: float = 0.0,
     no_normalize: bool = False,
+    include_sphere_offset: bool = False,
     jpeg_quality: int = 95,
     verbose: bool = True,
 ) -> Dict[str, Union[int, str, List[dict]]]:
@@ -684,7 +699,7 @@ def process_arkit_panoramas(
     # Load metadata
     records = []
     for img_path, json_source in pairs:
-        meta = load_arkit_metadata(json_source)
+        meta = load_arkit_metadata(json_source, include_sphere_offset=include_sphere_offset)
         meta["image_path"] = img_path
         if isinstance(json_source, Path):
             meta["json_path"] = json_source
@@ -981,6 +996,13 @@ def main():
         help="Use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
     )
     parser.add_argument(
+        "--include_sphere_offset", "--include-sphere-offset",
+        dest="include_sphere_offset",
+        action="store_true",
+        default=False,
+        help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically run MapAnything reconstruction after processing.",
@@ -1017,6 +1039,7 @@ def main():
         pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
         no_normalize=args.no_normalize,
+        include_sphere_offset=args.include_sphere_offset,
     )
 
     if args.run_reconstruction:
