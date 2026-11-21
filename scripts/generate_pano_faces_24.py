@@ -85,6 +85,13 @@ def main():
         help="Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
+        "--no_normalize", "--no-normalize",
+        dest="no_normalize",
+        action="store_true",
+        default=False,
+        help="Use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically trigger MapAnything 3D reconstruction after extracting perspective views.",
@@ -122,6 +129,7 @@ def main():
         fov_deg=args.fov,
         pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
+        no_normalize=args.no_normalize,
     )
 
     if args.run_reconstruction:

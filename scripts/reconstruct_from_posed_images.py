@@ -1030,6 +1030,7 @@ def reconstruct_from_posed_images(
     fov_deg: float = 90.0,
     anchor: Union[int, str] = 0,
     pano_yaw_offset: float = 0.0,
+    no_normalize: bool = False,
     cache_dir: Optional[Union[str, Path]] = None,
     # Camera visualization options:
     add_camera_markers: bool = True,
@@ -1088,6 +1089,7 @@ def reconstruct_from_posed_images(
                 fov_deg=fov_deg,
                 pano_yaw_offset=pano_yaw_offset,
                 anchor=anchor,
+                no_normalize=no_normalize,
                 verbose=verbose,
             )
             pano_res = res
@@ -1452,6 +1454,13 @@ def main():
         help="If --images contains raw panos, horizontal yaw offset in degrees (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
+        "--no_normalize", "--no-normalize",
+        dest="no_normalize",
+        action="store_true",
+        default=False,
+        help="If --images contains raw panos, use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -1642,6 +1651,7 @@ def main():
         fov_deg=args.fov,
         anchor=args.anchor,
         pano_yaw_offset=args.pano_yaw_offset,
+        no_normalize=args.no_normalize,
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,
         marker_radius=args.marker_radius,

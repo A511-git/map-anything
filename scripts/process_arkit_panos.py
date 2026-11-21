@@ -411,23 +411,16 @@ def compute_level1_normalized_poses(
     pano_records: List[dict],
     anchor_index: int = 0,
     pano_yaw_offset: float = 0.0,
+    no_normalize: bool = False,
 ) -> List[dict]:
     """
-    Unified Level 1 Normalization:
-    Transforms ARKit world coordinates (+X East, +Y Up, +Z South) into OpenCV RDF
-    cam2world poses in a true Y-Up right-handed world frame, setting the anchor
-    panorama at the origin [0, 0, 0] with canonical base orientation R_base = diag([1, -1, -1]).
-    
-    Elevation (+Y Up) is preserved as strictly positive upwards. Horizontal translations
-    and rotations are rigidly coupled via SE(3) transformation relative to Anchor Station.
-    
-    Args:
-        pano_records: List of dicts with 'image_path', 'json_path', 'origin_arkit', 'magnetic_heading_deg'
-        anchor_index: Index of the anchor panorama (default: 0)
-        pano_yaw_offset: Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0)
-    
-    Returns:
-        Updated list of dicts with 'c2w_pano_4x4', 't_pano_relative', 'R_pano_relative'
+    Level 1 Pose Computation:
+    - If no_normalize=False (default):
+      Anchors designated Pano at origin [0, 0, 0] with canonical orientation R_base = diag([1, -1, -1]).
+      Couples relative translations and rotations relative to Anchor Station.
+    - If no_normalize=True:
+      Uses direct ARKit world positions [X_east, Y_up, Z_south] and orientations converted to OpenCV RDF
+      via canonical R_base = diag([1, -1, -1]) world shift, preserving the exact global ARKit multi-station frame.
     """
     if not pano_records:
         return []
@@ -450,8 +443,51 @@ def compute_level1_normalized_poses(
         p_arkit = rec["origin_arkit"]
         h_deg = rec["magnetic_heading_deg"]
 
-        # Relative translation vector in ARKit coordinates (in meters)
-        # ARKit world coordinates: +X East, +Y UP, +Z South
+        if no_normalize:
+            # DIRECT ARKIT DATA:
+            # Use raw ARKit world coordinates without anchoring Station 0 to origin.
+            t_pano = p_arkit.copy()
+
+            # Convert camera orientation from ARKit convention to OpenCV RDF:
+            c2w_arkit = rec.get("c2w_arkit_4x4")
+            if c2w_arkit is not None:
+                R_arkit = c2w_arkit[:3, :3]
+                R_pano = R_arkit @ R_base
+                if pano_yaw_offset != 0.0:
+                    rad_off = np.radians(pano_yaw_offset)
+                    c_off, s_off = np.cos(rad_off), np.sin(rad_off)
+                    R_yaw_off = np.array([
+                        [c_off, 0.0, -s_off],
+                        [0.0, 1.0, 0.0],
+                        [s_off, 0.0, c_off],
+                    ], dtype=np.float32)
+                    R_pano = R_pano @ R_yaw_off
+            else:
+                h_eff = (h_deg + pano_yaw_offset) % 360.0
+                rad_h = np.radians(h_eff)
+                c_h, s_h = np.cos(rad_h), np.sin(rad_h)
+                R_yaw = np.array([
+                    [c_h, 0.0, -s_h],
+                    [0.0, 1.0, 0.0],
+                    [s_h, 0.0, c_h],
+                ], dtype=np.float32)
+                R_pano = R_yaw @ R_base
+
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = R_pano
+            c2w[:3, 3] = t_pano
+
+            rec_copy = dict(rec)
+            rec_copy["index"] = idx
+            rec_copy["is_anchor"] = (idx == anchor_index)
+            rec_copy["c2w_pano_4x4"] = c2w
+            rec_copy["R_pano_relative"] = R_pano
+            rec_copy["t_pano_relative"] = t_pano
+            rec_copy["euclidean_dist_from_anchor"] = float(np.linalg.norm(t_pano - p0_arkit))
+            normalized.append(rec_copy)
+            continue
+
+        # Normalized SE(3) Anchor Frame:
         delta_arkit = p_arkit - p0_arkit  # [delta_X (east), delta_Y (up), delta_Z (south)]
 
         delta_world = np.array([
@@ -472,16 +508,9 @@ def compute_level1_normalized_poses(
         ], dtype=np.float32)
         R_pano = R_rot @ R_base
 
-        # Scene alignment: Rotate ARKit longitudinal corridor (+Z_arkit) into camera corridor (-X_world)
-        # using canonical unitary SO(3) rotation R_scene = R_Y(+90 deg)
-        R_scene = np.array([
-            [0.0, 0.0, -1.0],
-            [0.0, 1.0,  0.0],
-            [1.0, 0.0,  0.0]
-        ], dtype=np.float32)
-
-        t_pano = R_scene @ delta_world
-        R_pano = R_scene @ R_pano
+        # Rotate horizontal translation into Anchor's reference frame (around +Y Up by -h0_deg)
+        R_world_to_anchor = rotation_matrix_y(-h0_deg)
+        t_pano = R_world_to_anchor @ delta_world
 
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R_pano
@@ -628,6 +657,7 @@ def process_arkit_panoramas(
     fov_deg: float = 90.0,
     anchor: Union[int, str] = 0,
     pano_yaw_offset: float = 0.0,
+    no_normalize: bool = False,
     jpeg_quality: int = 95,
     verbose: bool = True,
 ) -> Dict[str, Union[int, str, List[dict]]]:
@@ -667,19 +697,33 @@ def process_arkit_panoramas(
     # Resolve anchor
     anchor_idx = resolve_anchor_index(anchor, records)
 
-    # 2. Level 1 Normalization (Unified Y-Up SE(3) anchor frame)
-    normalized_panos = compute_level1_normalized_poses(records, anchor_index=anchor_idx, pano_yaw_offset=pano_yaw_offset)
+    # 2. Level 1 Normalization (or direct ARKit poses if no_normalize is set)
+    normalized_panos = compute_level1_normalized_poses(
+        records,
+        anchor_index=anchor_idx,
+        pano_yaw_offset=pano_yaw_offset,
+        no_normalize=no_normalize,
+    )
 
     if verbose:
-        print(f"\n--- Level 1 Normalization (Anchor: Pano [{anchor_idx}] {records[anchor_idx]['image_path'].name}) ---")
-        for p in normalized_panos:
-            t = p["t_pano_relative"]
-            h = p["magnetic_heading_deg"]
-            dist = p["euclidean_dist_from_anchor"]
-            tag = " (ANCHOR ORIGIN)" if p.get("is_anchor") else f" (Dist from anchor: {dist:.2f} m)"
-            print(f"Pano [{p['index']}] {p['image_path'].name}:")
-            print(f"  Position: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m{tag}")
-            print(f"  Heading:  {h:.1f}°")
+        if no_normalize:
+            print(f"\n--- Direct ARKit Poses (Unnormalized, using raw ARKit coordinates) ---")
+            for p in normalized_panos:
+                t = p["t_pano_relative"]
+                h = p["magnetic_heading_deg"]
+                print(f"Pano [{p['index']}] {p['image_path'].name}:")
+                print(f"  Position (ARKit World): [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m")
+                print(f"  Heading:  {h:.1f}°")
+        else:
+            print(f"\n--- Level 1 Normalization (Anchor: Pano [{anchor_idx}] {records[anchor_idx]['image_path'].name}) ---")
+            for p in normalized_panos:
+                t = p["t_pano_relative"]
+                h = p["magnetic_heading_deg"]
+                dist = p["euclidean_dist_from_anchor"]
+                tag = " (ANCHOR ORIGIN)" if p.get("is_anchor") else f" (Dist from anchor: {dist:.2f} m)"
+                print(f"Pano [{p['index']}] {p['image_path'].name}:")
+                print(f"  Position: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m{tag}")
+                print(f"  Heading:  {h:.1f}°")
 
     coord_system_doc = {
         "world_convention": "Y-Up Right-Handed (Standard Robotics / ARKit / Blender / Three.js)",
@@ -689,7 +733,8 @@ def process_arkit_panoramas(
             "+Z": "Horizontal South (longitudinal axis, units: meters, positive = south, negative = north/forward)",
         },
         "camera_convention": "OpenCV RDF (+X Right, +Y Down, +Z Optical Axis Forward in meters)",
-        "anchor_station": f"Station {anchor_idx} ({records[anchor_idx]['image_path'].name}) anchored at origin [0, 0, 0] with canonical orientation",
+        "anchor_station": "Direct ARKit World (Unnormalized)" if no_normalize else f"Station {anchor_idx} ({records[anchor_idx]['image_path'].name}) anchored at origin [0, 0, 0] with canonical orientation",
+        "normalization": "none (direct ARKit world coordinates)" if no_normalize else "anchored at origin [0,0,0]",
         "units": "meters",
     }
 
@@ -929,6 +974,13 @@ def main():
         help="Horizontal yaw offset in degrees to apply to panorama orientations (default: 0.0, use 180.0 if front/back lens is inverted).",
     )
     parser.add_argument(
+        "--no_normalize", "--no-normalize",
+        dest="no_normalize",
+        action="store_true",
+        default=False,
+        help="Use direct ARKit world coordinates and orientation without anchoring Station 0 to origin [0,0,0].",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically run MapAnything reconstruction after processing.",
@@ -964,6 +1016,7 @@ def main():
         fov_deg=args.fov,
         pano_yaw_offset=args.pano_yaw_offset,
         anchor=args.anchor,
+        no_normalize=args.no_normalize,
     )
 
     if args.run_reconstruction:

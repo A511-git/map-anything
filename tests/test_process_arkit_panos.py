@@ -76,8 +76,7 @@ def test_level1_normalization_math():
     # Pano 0 must be centered at origin with base orientation in Y-Up ARKit world
     c2w_0 = normalized[0]["c2w_pano_4x4"]
     R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
-    R_scene = np.array([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
-    np.testing.assert_allclose(c2w_0[:3, :3], R_scene @ R_base, atol=1e-6)
+    np.testing.assert_allclose(c2w_0[:3, :3], R_base, atol=1e-6)
     np.testing.assert_allclose(c2w_0[:3, 3], np.zeros(3), atol=1e-6)
     assert normalized[0]["euclidean_dist_from_anchor"] == 0.0
 
@@ -97,7 +96,7 @@ def test_level1_normalization_math():
         [0.0, 1.0, 0.0],
         [np.sin(rad_rel), 0.0, np.cos(rad_rel)],
     ], dtype=np.float32)
-    np.testing.assert_allclose(R1, R_scene @ (R_rot @ R_base), atol=1e-5)
+    np.testing.assert_allclose(R1, R_rot @ R_base, atol=1e-5)
 
 
 def test_unified_normalization_and_yaw_offset():
@@ -120,8 +119,7 @@ def test_unified_normalization_and_yaw_offset():
 
     # Standard unified normalization:
     norm = compute_level1_normalized_poses(records)
-    R_scene = np.array([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
-    np.testing.assert_allclose(norm[0]["R_pano_relative"], R_scene @ R_base)
+    np.testing.assert_allclose(norm[0]["R_pano_relative"], R_base)
     # Elevation (+Y) is strictly preserved: delta Y = 0.5m
     assert pytest.approx(norm[1]["t_pano_relative"][1], abs=1e-5) == 0.5
     # Distance is preserved (1^2 + 0.5^2 + 2^2 = 5.25, sqrt = 2.291)
@@ -132,6 +130,48 @@ def test_unified_normalization_and_yaw_offset():
     norm_offset = compute_level1_normalized_poses(records, pano_yaw_offset=180.0)
     assert norm_offset[1]["R_pano_relative"].shape == (3, 3)
     np.testing.assert_allclose(norm_offset[0]["t_pano_relative"], [0, 0, 0])
+
+
+def test_direct_arkit_poses_no_normalize():
+    """
+    Test that --no_normalize preserves direct ARKit 3D positions and rotations
+    with the required OpenCV RDF world shift without anchoring Station 0 to origin.
+    """
+    records = [
+        {
+            "origin_arkit": np.array([-5.48057, -1.05866, 7.30959], dtype=np.float32),
+            "magnetic_heading_deg": 133.43,
+            "image_path": Path("station_0.jpg"),
+            "json_path": Path("station_0.json"),
+        },
+        {
+            "origin_arkit": np.array([-5.84578, -0.97167, 9.50135], dtype=np.float32),
+            "magnetic_heading_deg": 42.84,
+            "image_path": Path("station_1.jpg"),
+            "json_path": Path("station_1.json"),
+        },
+    ]
+
+    R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    poses = compute_level1_normalized_poses(records, no_normalize=True)
+    assert len(poses) == 2
+
+    # Station 0 must retain its direct ARKit position (not origin [0,0,0])
+    np.testing.assert_allclose(poses[0]["t_pano_relative"], [-5.48057, -1.05866, 7.30959], atol=1e-4)
+    # Station 1 must retain its direct ARKit position
+    np.testing.assert_allclose(poses[1]["t_pano_relative"], [-5.84578, -0.97167, 9.50135], atol=1e-4)
+
+    # Relative distance between stations must strictly match raw ARKit Euclidean distance
+    dist = np.linalg.norm(poses[1]["t_pano_relative"] - poses[0]["t_pano_relative"])
+    expected = np.linalg.norm(records[1]["origin_arkit"] - records[0]["origin_arkit"])
+    assert pytest.approx(dist, rel=1e-5) == expected
+
+    # Both rotation matrices must be proper SO(3) rotations (det = +1.0)
+    for p in poses:
+        R = p["R_pano_relative"]
+        np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-5)
+        np.testing.assert_allclose(np.linalg.det(R), 1.0, atol=1e-5)
 
 
 def test_level2_perspective_face_definitions():
