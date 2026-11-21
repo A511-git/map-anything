@@ -440,6 +440,25 @@ def resolve_anchor_index(anchor_spec: Union[int, str, None], pano_records: List[
     return 0
 
 
+def parse_flip_axes(val: Union[str, List[str], None]) -> Tuple[bool, bool, bool]:
+    """
+    Parse a flip specification string such as 'x,y', 'y,z', 'x,z', 'x', 'y', 'z', 'xy', 'yz', 'xz', 'xyz'.
+    Returns (flip_x, flip_y, flip_z) as booleans.
+    """
+    if val is None or val is False or val == "":
+        return False, False, False
+    if isinstance(val, (list, tuple)):
+        s = ",".join(str(x) for x in val).lower()
+    else:
+        s = str(val).lower().strip()
+    if s in ["none", "false", "0"]:
+        return False, False, False
+    flip_x = "x" in s
+    flip_y = "y" in s
+    flip_z = "z" in s
+    return flip_x, flip_y, flip_z
+
+
 def compute_level1_normalized_poses(
     pano_records: List[dict],
     anchor_index: int = 0,
@@ -448,6 +467,10 @@ def compute_level1_normalized_poses(
     flip_x: bool = False,
     flip_y: bool = False,
     flip_z: bool = False,
+    flip: Optional[str] = None,
+    flip_translation: Optional[str] = None,
+    flip_rotation: Optional[str] = None,
+    invert_rotation: bool = False,
 ) -> List[dict]:
     """
     Level 1 Pose Computation:
@@ -457,31 +480,63 @@ def compute_level1_normalized_poses(
     - If no_normalize=True:
       Uses direct ARKit world positions [X_east, Y_up, Z_south] and orientations converted to OpenCV RDF
       via canonical R_base = diag([1, -1, -1]) world shift, preserving the exact global ARKit multi-station frame.
-    - If flip_x, flip_y, flip_z are set:
+    - If flip_x, flip_y, flip_z, or flip='x,y' / 'y,z' are set:
       Reflects corresponding world axes while preserving valid SO(3) rotations (det = +1.0).
+    - If flip_translation or flip_rotation or invert_rotation are set:
+      Allows independent reflection or inversion of translation and rotation.
     """
     if not pano_records:
         return []
 
     assert 0 <= anchor_index < len(pano_records), f"Invalid anchor_index {anchor_index}, total: {len(pano_records)}"
 
+    tx_flip, ty_flip, tz_flip = flip_x, flip_y, flip_z
+    rx_flip, ry_flip, rz_flip = flip_x, flip_y, flip_z
+
+    # Parse flip argument if provided (applies to both trans and rot by default)
+    if flip:
+        fx, fy, fz = parse_flip_axes(flip)
+        tx_flip = tx_flip or fx
+        ty_flip = ty_flip or fy
+        tz_flip = tz_flip or fz
+        rx_flip = rx_flip or fx
+        ry_flip = ry_flip or fy
+        rz_flip = rz_flip or fz
+
+    # Optional independent translation flip override
+    if flip_translation is not None:
+        tx_flip, ty_flip, tz_flip = parse_flip_axes(flip_translation)
+
+    # Optional independent rotation flip override
+    if flip_rotation is not None:
+        s_rot = str(flip_rotation).lower()
+        if "yaw" in s_rot or "inv" in s_rot:
+            invert_rotation = True
+        else:
+            rx_flip, ry_flip, rz_flip = parse_flip_axes(flip_rotation)
+
     # Anchor pano
     p0_arkit = pano_records[anchor_index]["origin_arkit"]
     h0_deg = pano_records[anchor_index]["magnetic_heading_deg"]
 
     # Base orientation for OpenCV RDF camera in Y-Up World (facing North):
-    # Camera +X (Right) -> World +X (East)
-    # Camera +Y (Down) -> World -Y (Down)
-    # Camera +Z (Forward) -> World -Z (North)
-    # Proper rotation in SO(3): det(R_base) = +1.0
     R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
 
-    # Axis reflection matrix S
-    sx = -1.0 if flip_x else 1.0
-    sy = -1.0 if flip_y else 1.0
-    sz = -1.0 if flip_z else 1.0
-    S_flip = np.diag([sx, sy, sz]).astype(np.float32)
-    has_flips = (flip_x or flip_y or flip_z)
+    # Axis reflection matrices
+    S_trans = np.diag([
+        -1.0 if tx_flip else 1.0,
+        -1.0 if ty_flip else 1.0,
+        -1.0 if tz_flip else 1.0,
+    ]).astype(np.float32)
+
+    S_rot = np.diag([
+        -1.0 if rx_flip else 1.0,
+        -1.0 if ry_flip else 1.0,
+        -1.0 if rz_flip else 1.0,
+    ]).astype(np.float32)
+
+    has_trans_flips = (tx_flip or ty_flip or tz_flip)
+    has_rot_flips = (rx_flip or ry_flip or rz_flip or invert_rotation)
 
     normalized = []
     for idx, rec in enumerate(pano_records):
@@ -506,9 +561,12 @@ def compute_level1_normalized_poses(
                 R_yaw = rotation_matrix_y_world(h_eff)
                 R_pano = R_yaw @ R_base
 
-            if has_flips:
-                t_pano = S_flip @ t_pano
-                R_pano = S_flip @ R_pano @ S_flip
+            if has_trans_flips:
+                t_pano = S_trans @ t_pano
+            if rx_flip or ry_flip or rz_flip:
+                R_pano = S_rot @ R_pano @ S_rot
+            if invert_rotation:
+                R_pano = R_pano.T
 
             c2w = np.eye(4, dtype=np.float32)
             c2w[:3, :3] = R_pano
@@ -520,7 +578,7 @@ def compute_level1_normalized_poses(
             rec_copy["c2w_pano_4x4"] = c2w
             rec_copy["R_pano_relative"] = R_pano
             rec_copy["t_pano_relative"] = t_pano
-            rec_copy["euclidean_dist_from_anchor"] = float(np.linalg.norm(t_pano - (S_flip @ p0_arkit if has_flips else p0_arkit)))
+            rec_copy["euclidean_dist_from_anchor"] = float(np.linalg.norm(t_pano - (S_trans @ p0_arkit if has_trans_flips else p0_arkit)))
             normalized.append(rec_copy)
             continue
 
@@ -542,9 +600,12 @@ def compute_level1_normalized_poses(
         R_world_to_anchor = rotation_matrix_y_world(-h0_deg)
         t_pano = R_world_to_anchor @ delta_world
 
-        if has_flips:
-            t_pano = S_flip @ t_pano
-            R_pano = S_flip @ R_pano @ S_flip
+        if has_trans_flips:
+            t_pano = S_trans @ t_pano
+        if rx_flip or ry_flip or rz_flip:
+            R_pano = S_rot @ R_pano @ S_rot
+        if invert_rotation:
+            R_pano = R_pano.T
 
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R_pano
@@ -696,6 +757,10 @@ def process_arkit_panoramas(
     flip_x: bool = False,
     flip_y: bool = False,
     flip_z: bool = False,
+    flip: Optional[str] = None,
+    flip_translation: Optional[str] = None,
+    flip_rotation: Optional[str] = None,
+    invert_rotation: bool = False,
     jpeg_quality: int = 95,
     verbose: bool = True,
 ) -> Dict[str, Union[int, str, List[dict]]]:
@@ -744,6 +809,10 @@ def process_arkit_panoramas(
         flip_x=flip_x,
         flip_y=flip_y,
         flip_z=flip_z,
+        flip=flip,
+        flip_translation=flip_translation,
+        flip_rotation=flip_rotation,
+        invert_rotation=invert_rotation,
     )
 
     if verbose:
@@ -1029,6 +1098,33 @@ def main():
         help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
     )
     parser.add_argument(
+        "--flip",
+        type=str,
+        default=None,
+        help="Specify axes to flip for both translation and rotation (e.g. 'x,y', 'y,z', 'x,z', 'x', 'y', 'z').",
+    )
+    parser.add_argument(
+        "--flip_translation", "--flip-translation", "--flip_trans", "--flip-trans",
+        dest="flip_translation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera translations (e.g. 'x,y', 'y,z', 'x').",
+    )
+    parser.add_argument(
+        "--flip_rotation", "--flip-rotation", "--flip_rot", "--flip-rot",
+        dest="flip_rotation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera rotations (e.g. 'x,y', 'y,z', 'x', or 'yaw').",
+    )
+    parser.add_argument(
+        "--invert_rotation", "--invert-rotation", "--flip_yaw", "--flip-yaw",
+        dest="invert_rotation",
+        action="store_true",
+        default=False,
+        help="Invert / transpose camera rotation matrix (R -> R^T, inverts yaw heading).",
+    )
+    parser.add_argument(
         "--flip_x", "--flip-x",
         dest="flip_x",
         action="store_true",
@@ -1090,6 +1186,10 @@ def main():
         flip_x=args.flip_x,
         flip_y=args.flip_y,
         flip_z=args.flip_z,
+        flip=args.flip,
+        flip_translation=args.flip_translation,
+        flip_rotation=args.flip_rotation,
+        invert_rotation=args.invert_rotation,
     )
 
     if args.run_reconstruction:

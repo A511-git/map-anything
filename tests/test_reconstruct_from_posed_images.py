@@ -205,6 +205,30 @@ def test_apply_pose_flips():
     assert pytest.approx(p_fz[2, 3], abs=1e-4) == -7.212
     assert pytest.approx(float(np.linalg.det(p_fz[:3, :3])), abs=1e-5) == 1.0
 
+    # 4. Flip combo "x,y"
+    p_fxy = apply_pose_flips([pose], flip="x,y")[0]
+    assert pytest.approx(p_fxy[0, 3], abs=1e-4) == 5.511
+    assert pytest.approx(p_fxy[1, 3], abs=1e-4) == 1.059
+    assert pytest.approx(p_fxy[2, 3], abs=1e-4) == 7.212
+    assert pytest.approx(float(np.linalg.det(p_fxy[:3, :3])), abs=1e-5) == 1.0
+
+    # 5. Flip translation only
+    p_trans = apply_pose_flips([pose], flip_translation="x,y")[0]
+    assert pytest.approx(p_trans[0, 3], abs=1e-4) == 5.511
+    assert pytest.approx(p_trans[1, 3], abs=1e-4) == 1.059
+    # Rotation remains original
+    np.testing.assert_allclose(p_trans[:3, :3], R, atol=1e-5)
+
+    # 6. Flip rotation only
+    p_rot = apply_pose_flips([pose], flip_rotation="x")[0]
+    # Translation remains original
+    assert pytest.approx(p_rot[0, 3], abs=1e-4) == -5.511
+    assert pytest.approx(float(np.linalg.det(p_rot[:3, :3])), abs=1e-5) == 1.0
+
+    # 7. Invert rotation
+    p_inv = apply_pose_flips([pose], invert_rotation=True)[0]
+    np.testing.assert_allclose(p_inv[:3, :3], R.T, atol=1e-5)
+
 
 def test_multi_flip_outputs_cli_parsing():
     from scripts.reconstruct_from_posed_images import main
@@ -219,6 +243,17 @@ def test_multi_flip_outputs_cli_parsing():
                     assert mock_recon.called
                     call_kwargs = mock_recon.call_args[1]
                     assert call_kwargs["multi_flip_outputs"] is True
+
+    test_args_flip = ["reconstruct_from_posed_images.py", "--images", "dummy_dir", "--flip", "x,y", "--invert-rotation"]
+    with mock.patch("sys.argv", test_args_flip):
+        with mock.patch("scripts.reconstruct_from_posed_images.reconstruct_from_posed_images") as mock_recon:
+            with mock.patch("scripts.reconstruct_from_posed_images.find_images", return_value=(["dummy.jpg"], ["dummy.jpg"])):
+                with mock.patch("scripts.reconstruct_from_posed_images.load_poses", return_value=[np.eye(4)]):
+                    main()
+                    assert mock_recon.called
+                    call_kwargs = mock_recon.call_args[1]
+                    assert call_kwargs["flip"] == "x,y"
+                    assert call_kwargs["invert_rotation"] is True
 
 
 if __name__ == "__main__":

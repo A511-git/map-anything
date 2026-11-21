@@ -157,33 +157,90 @@ def convert_pose_convention(pose: np.ndarray, from_convention: str = "opencv") -
         )
 
 
+def parse_flip_axes(val: Union[str, List[str], None]) -> Tuple[bool, bool, bool]:
+    """
+    Parse a flip specification string such as 'x,y', 'y,z', 'x,z', 'x', 'y', 'z', 'xy', 'yz', 'xz', 'xyz'.
+    Returns (flip_x, flip_y, flip_z) as booleans.
+    """
+    if val is None or val is False or val == "":
+        return False, False, False
+    if isinstance(val, (list, tuple)):
+        s = ",".join(str(x) for x in val).lower()
+    else:
+        s = str(val).lower().strip()
+    if s in ["none", "false", "0"]:
+        return False, False, False
+    return "x" in s, "y" in s, "z" in s
+
+
 def apply_pose_flips(
     poses: List[np.ndarray],
     flip_x: bool = False,
     flip_y: bool = False,
     flip_z: bool = False,
+    flip: Optional[str] = None,
+    flip_translation: Optional[str] = None,
+    flip_rotation: Optional[str] = None,
+    invert_rotation: bool = False,
 ) -> List[np.ndarray]:
     """
     Reflect camera poses across selected world axes while strictly preserving SO(3) rotation validity (det = +1.0).
-    - flip_x: Negates X coordinate (transversal / east-west)
-    - flip_y: Negates Y coordinate (vertical / elevation)
-    - flip_z: Negates Z coordinate (longitudinal / north-south)
+    - flip: Comma-separated axes for both translation and rotation (e.g. 'x,y', 'y,z', 'x,z').
+    - flip_translation: Reflect ONLY translation coordinates on specified axes.
+    - flip_rotation: Reflect ONLY camera rotation matrices on specified axes (or 'yaw').
+    - invert_rotation: Invert/transpose rotation matrix (R -> R^T, inverts yaw heading).
     """
-    if not (flip_x or flip_y or flip_z):
+    tx_flip, ty_flip, tz_flip = flip_x, flip_y, flip_z
+    rx_flip, ry_flip, rz_flip = flip_x, flip_y, flip_z
+
+    if flip:
+        fx, fy, fz = parse_flip_axes(flip)
+        tx_flip = tx_flip or fx
+        ty_flip = ty_flip or fy
+        tz_flip = tz_flip or fz
+        rx_flip = rx_flip or fx
+        ry_flip = ry_flip or fy
+        rz_flip = rz_flip or fz
+
+    if flip_translation is not None:
+        tx_flip, ty_flip, tz_flip = parse_flip_axes(flip_translation)
+
+    if flip_rotation is not None:
+        s_rot = str(flip_rotation).lower()
+        if "yaw" in s_rot or "inv" in s_rot:
+            invert_rotation = True
+        else:
+            rx_flip, ry_flip, rz_flip = parse_flip_axes(flip_rotation)
+
+    has_trans = (tx_flip or ty_flip or tz_flip)
+    has_rot = (rx_flip or ry_flip or rz_flip or invert_rotation)
+
+    if not (has_trans or has_rot):
         return poses
 
-    sx = -1.0 if flip_x else 1.0
-    sy = -1.0 if flip_y else 1.0
-    sz = -1.0 if flip_z else 1.0
-    S = np.diag([sx, sy, sz]).astype(np.float32)
+    S_trans = np.diag([
+        -1.0 if tx_flip else 1.0,
+        -1.0 if ty_flip else 1.0,
+        -1.0 if tz_flip else 1.0,
+    ]).astype(np.float32)
+
+    S_rot = np.diag([
+        -1.0 if rx_flip else 1.0,
+        -1.0 if ry_flip else 1.0,
+        -1.0 if rz_flip else 1.0,
+    ]).astype(np.float32)
 
     flipped = []
     for p in poses:
         p_new = np.array(p, dtype=np.float32).copy()
-        # Reflect 3D translation
-        p_new[:3, 3] = S @ p_new[:3, 3]
-        # Conjugate rotation to keep det(R') = det(S)*det(R)*det(S) = (-1)*(+1)*(-1) = +1.0
-        p_new[:3, :3] = S @ p_new[:3, :3] @ S
+        if has_trans:
+            p_new[:3, 3] = S_trans @ p_new[:3, 3]
+        R = p_new[:3, :3]
+        if rx_flip or ry_flip or rz_flip:
+            R = S_rot @ R @ S_rot
+        if invert_rotation:
+            R = R.T
+        p_new[:3, :3] = R
         flipped.append(p_new)
     return flipped
 
@@ -1066,6 +1123,10 @@ def reconstruct_from_posed_images(
     flip_x: bool = False,
     flip_y: bool = False,
     flip_z: bool = False,
+    flip: Optional[str] = None,
+    flip_translation: Optional[str] = None,
+    flip_rotation: Optional[str] = None,
+    invert_rotation: bool = False,
     multi_flip_outputs: bool = False,
     cache_dir: Optional[Union[str, Path]] = None,
     # Camera visualization options:
@@ -1130,6 +1191,10 @@ def reconstruct_from_posed_images(
                 flip_x=flip_x,
                 flip_y=flip_y,
                 flip_z=flip_z,
+                flip=flip,
+                flip_translation=flip_translation,
+                flip_rotation=flip_rotation,
+                invert_rotation=invert_rotation,
                 verbose=verbose,
             )
             pano_res = res
@@ -1208,10 +1273,19 @@ def reconstruct_from_posed_images(
     else:
         raise ValueError(f"Unsupported type for poses: {type(poses)}")
 
-    if (flip_x or flip_y or flip_z) and pano_res is None:
-        loaded_poses = apply_pose_flips(loaded_poses, flip_x=flip_x, flip_y=flip_y, flip_z=flip_z)
+    if (flip_x or flip_y or flip_z or flip or flip_translation or flip_rotation or invert_rotation) and pano_res is None:
+        loaded_poses = apply_pose_flips(
+            loaded_poses,
+            flip_x=flip_x,
+            flip_y=flip_y,
+            flip_z=flip_z,
+            flip=flip,
+            flip_translation=flip_translation,
+            flip_rotation=flip_rotation,
+            invert_rotation=invert_rotation,
+        )
         if verbose:
-            print(f"[Pose Flip] Applied coordinate flips (flip_x={flip_x}, flip_y={flip_y}, flip_z={flip_z}) to loaded poses.")
+            print(f"[Pose Flip] Applied flips (flip={flip}, flip_trans={flip_translation}, flip_rot={flip_rotation}, invert_rot={invert_rotation}) to loaded poses.")
 
     if not model_decides_face_poses and len(loaded_poses) != num_views:
         raise ValueError(f"Mismatch between number of images ({num_views}) and poses ({len(loaded_poses)})")
@@ -1442,18 +1516,22 @@ def reconstruct_from_posed_images(
             dense=dense,
         )
 
-        # Multi-Flip Outputs: generate 3 combo outputs (-X, -Y, -Z)
+        # Multi-Flip Outputs: generate combo outputs
         if multi_flip_outputs and outputs is not None:
             out_base_dir = Path(resolved_output_path).parent
             flip_combos = [
-                ("flip_x", True, False, False),
-                ("flip_y", False, True, False),
-                ("flip_z", False, False, True),
+                ("flip_x", True, False, False, False),
+                ("flip_y", False, True, False, False),
+                ("flip_z", False, False, True, False),
+                ("flip_xy", True, True, False, False),
+                ("flip_xz", True, False, True, False),
+                ("flip_yz", False, True, True, False),
+                ("flip_yaw", False, False, False, True),
             ]
             if verbose:
-                print(f"\n[Multi-Flip] Generating 3 combo outputs (-X, -Y, -Z) in: {out_base_dir}...")
-            for combo_name, fx, fy, fz in flip_combos:
-                combo_poses = apply_pose_flips(loaded_poses, flip_x=fx, flip_y=fy, flip_z=fz)
+                print(f"\n[Multi-Flip] Generating combo outputs (-X, -Y, -Z, -XY, -XZ, -YZ, YAW_INV) in: {out_base_dir}...")
+            for combo_name, fx, fy, fz, inv_r in flip_combos:
+                combo_poses = apply_pose_flips(loaded_poses, flip_x=fx, flip_y=fy, flip_z=fz, invert_rotation=inv_r)
                 combo_points = []
                 combo_colors = []
                 for v_idx, pred in enumerate(outputs):
@@ -1718,6 +1796,33 @@ def main():
         help="Let the MapAnything model estimate the relative camera pose of each perspective face within a panorama, while anchoring the panorama as a whole using the provided global ARKit/GPS pose.",
     )
     parser.add_argument(
+        "--flip",
+        type=str,
+        default=None,
+        help="Specify axes to flip for both translation and rotation (e.g. 'x,y', 'y,z', 'x,z', 'x', 'y', 'z').",
+    )
+    parser.add_argument(
+        "--flip_translation", "--flip-translation", "--flip_trans", "--flip-trans",
+        dest="flip_translation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera translations (e.g. 'x,y', 'y,z', 'x').",
+    )
+    parser.add_argument(
+        "--flip_rotation", "--flip-rotation", "--flip_rot", "--flip-rot",
+        dest="flip_rotation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera rotations (e.g. 'x,y', 'y,z', 'x', or 'yaw').",
+    )
+    parser.add_argument(
+        "--invert_rotation", "--invert-rotation", "--flip_yaw", "--flip-yaw",
+        dest="invert_rotation",
+        action="store_true",
+        default=False,
+        help="Invert / transpose camera rotation matrix (R -> R^T, inverts yaw heading).",
+    )
+    parser.add_argument(
         "--flip_x", "--flip-x",
         dest="flip_x",
         action="store_true",
@@ -1743,7 +1848,7 @@ def main():
         dest="multi_flip_outputs",
         action="store_true",
         default=False,
-        help="Generate 3 combo point cloud outputs (-X, -Y, -Z axis reflections) in one run.",
+        help="Generate combo point cloud outputs (-X, -Y, -Z, -XY, -XZ, -YZ, YAW_INV) in one run.",
     )
 
     args = parser.parse_args()
@@ -1791,6 +1896,10 @@ def main():
         flip_x=args.flip_x,
         flip_y=args.flip_y,
         flip_z=args.flip_z,
+        flip=args.flip,
+        flip_translation=args.flip_translation,
+        flip_rotation=args.flip_rotation,
+        invert_rotation=args.invert_rotation,
         multi_flip_outputs=args.multi_flip_outputs,
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,

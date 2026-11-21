@@ -99,6 +99,33 @@ def main():
         help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
     )
     parser.add_argument(
+        "--flip",
+        type=str,
+        default=None,
+        help="Specify axes to flip for both translation and rotation (e.g. 'x,y', 'y,z', 'x,z', 'x', 'y', 'z').",
+    )
+    parser.add_argument(
+        "--flip_translation", "--flip-translation", "--flip_trans", "--flip-trans",
+        dest="flip_translation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera translations (e.g. 'x,y', 'y,z', 'x').",
+    )
+    parser.add_argument(
+        "--flip_rotation", "--flip-rotation", "--flip_rot", "--flip-rot",
+        dest="flip_rotation",
+        type=str,
+        default=None,
+        help="Specify axes to flip ONLY for camera rotations (e.g. 'x,y', 'y,z', 'x', or 'yaw').",
+    )
+    parser.add_argument(
+        "--invert_rotation", "--invert-rotation", "--flip_yaw", "--flip-yaw",
+        dest="invert_rotation",
+        action="store_true",
+        default=False,
+        help="Invert / transpose camera rotation matrix (R -> R^T, inverts yaw heading).",
+    )
+    parser.add_argument(
         "--flip_x", "--flip-x",
         dest="flip_x",
         action="store_true",
@@ -162,6 +189,10 @@ def main():
         flip_x=args.flip_x,
         flip_y=args.flip_y,
         flip_z=args.flip_z,
+        flip=args.flip,
+        flip_translation=args.flip_translation,
+        flip_rotation=args.flip_rotation,
+        invert_rotation=args.invert_rotation,
     )
 
     if args.run_reconstruction:

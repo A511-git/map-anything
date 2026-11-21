@@ -734,6 +734,32 @@ def test_axis_flips_and_so3_validity():
         R = p["c2w_pano_4x4"][:3, :3]
         assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
 
+    # 5. Flip combo 'x,y'
+    panos_fxy = compute_level1_normalized_poses(records, no_normalize=True, flip="x,y")
+    t0_fxy = panos_fxy[0]["t_pano_relative"]
+    assert pytest.approx(t0_fxy[0], abs=1e-4) == 5.511
+    assert pytest.approx(t0_fxy[1], abs=1e-4) == 1.059
+    assert pytest.approx(t0_fxy[2], abs=1e-4) == 7.212
+    for p in panos_fxy:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+    # 6. Flip combo 'y,z'
+    panos_fyz = compute_level1_normalized_poses(records, no_normalize=True, flip="y,z")
+    t0_fyz = panos_fyz[0]["t_pano_relative"]
+    assert pytest.approx(t0_fyz[0], abs=1e-4) == -5.511
+    assert pytest.approx(t0_fyz[1], abs=1e-4) == 1.059
+    assert pytest.approx(t0_fyz[2], abs=1e-4) == -7.212
+    for p in panos_fyz:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+    # 7. Invert rotation
+    panos_inv = compute_level1_normalized_poses(records, no_normalize=True, invert_rotation=True)
+    for p in panos_inv:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
