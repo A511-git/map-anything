@@ -460,15 +460,8 @@ def compute_level1_normalized_poses(
             delta_arkit[2],      # South -> +Z
         ], dtype=np.float32)
 
-        # Rotate horizontal translation into Anchor's reference frame (around +Y Up)
-        rad0 = np.radians(-h0_deg)
-        cos0 = np.cos(rad0)
-        sin0 = np.sin(rad0)
-        R_world_to_anchor = np.array([
-            [cos0, 0.0, -sin0],
-            [0.0, 1.0, 0.0],
-            [sin0, 0.0, cos0],
-        ], dtype=np.float32)
+        # Rotate horizontal translation into Anchor's reference frame (around +Y Up by -h0_deg)
+        R_world_to_anchor = rotation_matrix_y(-h0_deg)
         t_pano = R_world_to_anchor @ delta_world
 
         # Relative heading delta with optional lens offset
