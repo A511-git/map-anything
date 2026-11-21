@@ -311,7 +311,7 @@ def load_arkit_metadata(json_source: Union[str, Path, dict]) -> dict:
     # Extract heading: check arKitData originHeading, magneticHeading, headingAtPlace, or heading
     heading = None
     if isinstance(arkit_data, dict):
-        heading = arKitData.get("originHeading") if (arkit_data is not None and "originHeading" in arkit_data) else None
+        heading = arkit_data.get("originHeading") if "originHeading" in arkit_data else None
     if heading is None:
         heading = data.get("magnetic_heading_deg")
     if heading is None:

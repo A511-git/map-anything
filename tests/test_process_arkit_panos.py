@@ -389,6 +389,37 @@ def test_aggregate_jobdata_end_to_end_synthetic():
         assert exported_meta[1]["scan_chain_index"] == 2
 
 
+
+def test_load_arkit_metadata_formats():
+    """
+    Test load_arkit_metadata across different JSON structures including arKitData with originHeading.
+    """
+    from scripts.process_arkit_panos import load_arkit_metadata
+    
+    # 1. Jobdata structure with arKitData dictionary
+    data_jobdata = {
+        "jobId": "test_job_1",
+        "arKitData": {
+            "origin": [1.5, 0.2, -3.4],
+            "originHeading": 142.5,
+            "originPose": [1,0,0,0, 0,1,0,0, 0,0,1,0, 1.5,0.2,-3.4,1]
+        }
+    }
+    meta = load_arkit_metadata(data_jobdata)
+    assert np.allclose(meta["origin_arkit"], [1.5, 0.2, -3.4])
+    assert np.isclose(meta["magnetic_heading_deg"], 142.5)
+
+    # 2. Normalized metadata structure with origin_arkit_xyz and magnetic_heading_deg
+    data_normalized = {
+        "job_id": "test_job_2",
+        "origin_arkit_xyz": [0.0, 1.0, 2.0],
+        "magnetic_heading_deg": 45.0
+    }
+    meta2 = load_arkit_metadata(data_normalized)
+    assert np.allclose(meta2["origin_arkit"], [0.0, 1.0, 2.0])
+    assert np.isclose(meta2["magnetic_heading_deg"], 45.0)
+
+
 def test_real_jobdata_directory_detection():
     """
     Test that the actual jobdata/ directory in the workspace is correctly detected
