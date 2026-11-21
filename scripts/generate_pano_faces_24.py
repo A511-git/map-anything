@@ -99,6 +99,27 @@ def main():
         help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
     )
     parser.add_argument(
+        "--flip_x", "--flip-x",
+        dest="flip_x",
+        action="store_true",
+        default=False,
+        help="Multiply X world coordinate by -1 (reflect across X axis).",
+    )
+    parser.add_argument(
+        "--flip_y", "--flip-y",
+        dest="flip_y",
+        action="store_true",
+        default=False,
+        help="Multiply Y world coordinate by -1 (reflect across Y axis).",
+    )
+    parser.add_argument(
+        "--flip_z", "--flip-z",
+        dest="flip_z",
+        action="store_true",
+        default=False,
+        help="Multiply Z world coordinate by -1 (reflect across Z axis).",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically trigger MapAnything 3D reconstruction after extracting perspective views.",
@@ -138,6 +159,9 @@ def main():
         anchor=args.anchor,
         no_normalize=args.no_normalize,
         include_sphere_offset=args.include_sphere_offset,
+        flip_x=args.flip_x,
+        flip_y=args.flip_y,
+        flip_z=args.flip_z,
     )
 
     if args.run_reconstruction:

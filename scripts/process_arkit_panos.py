@@ -445,6 +445,9 @@ def compute_level1_normalized_poses(
     anchor_index: int = 0,
     pano_yaw_offset: float = 0.0,
     no_normalize: bool = False,
+    flip_x: bool = False,
+    flip_y: bool = False,
+    flip_z: bool = False,
 ) -> List[dict]:
     """
     Level 1 Pose Computation:
@@ -454,6 +457,8 @@ def compute_level1_normalized_poses(
     - If no_normalize=True:
       Uses direct ARKit world positions [X_east, Y_up, Z_south] and orientations converted to OpenCV RDF
       via canonical R_base = diag([1, -1, -1]) world shift, preserving the exact global ARKit multi-station frame.
+    - If flip_x, flip_y, flip_z are set:
+      Reflects corresponding world axes while preserving valid SO(3) rotations (det = +1.0).
     """
     if not pano_records:
         return []
@@ -470,6 +475,13 @@ def compute_level1_normalized_poses(
     # Camera +Z (Forward) -> World -Z (North)
     # Proper rotation in SO(3): det(R_base) = +1.0
     R_base = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+
+    # Axis reflection matrix S
+    sx = -1.0 if flip_x else 1.0
+    sy = -1.0 if flip_y else 1.0
+    sz = -1.0 if flip_z else 1.0
+    S_flip = np.diag([sx, sy, sz]).astype(np.float32)
+    has_flips = (flip_x or flip_y or flip_z)
 
     normalized = []
     for idx, rec in enumerate(pano_records):
@@ -494,6 +506,10 @@ def compute_level1_normalized_poses(
                 R_yaw = rotation_matrix_y_world(h_eff)
                 R_pano = R_yaw @ R_base
 
+            if has_flips:
+                t_pano = S_flip @ t_pano
+                R_pano = S_flip @ R_pano @ S_flip
+
             c2w = np.eye(4, dtype=np.float32)
             c2w[:3, :3] = R_pano
             c2w[:3, 3] = t_pano
@@ -504,7 +520,7 @@ def compute_level1_normalized_poses(
             rec_copy["c2w_pano_4x4"] = c2w
             rec_copy["R_pano_relative"] = R_pano
             rec_copy["t_pano_relative"] = t_pano
-            rec_copy["euclidean_dist_from_anchor"] = float(np.linalg.norm(t_pano - p0_arkit))
+            rec_copy["euclidean_dist_from_anchor"] = float(np.linalg.norm(t_pano - (S_flip @ p0_arkit if has_flips else p0_arkit)))
             normalized.append(rec_copy)
             continue
 
@@ -525,6 +541,10 @@ def compute_level1_normalized_poses(
         # Rotate horizontal translation into Anchor's reference frame (around +Y Up by -h0_deg)
         R_world_to_anchor = rotation_matrix_y_world(-h0_deg)
         t_pano = R_world_to_anchor @ delta_world
+
+        if has_flips:
+            t_pano = S_flip @ t_pano
+            R_pano = S_flip @ R_pano @ S_flip
 
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R_pano
@@ -673,6 +693,9 @@ def process_arkit_panoramas(
     pano_yaw_offset: float = 0.0,
     no_normalize: bool = False,
     include_sphere_offset: bool = False,
+    flip_x: bool = False,
+    flip_y: bool = False,
+    flip_z: bool = False,
     jpeg_quality: int = 95,
     verbose: bool = True,
 ) -> Dict[str, Union[int, str, List[dict]]]:
@@ -718,6 +741,9 @@ def process_arkit_panoramas(
         anchor_index=anchor_idx,
         pano_yaw_offset=pano_yaw_offset,
         no_normalize=no_normalize,
+        flip_x=flip_x,
+        flip_y=flip_y,
+        flip_z=flip_z,
     )
 
     if verbose:
@@ -1003,6 +1029,27 @@ def main():
         help="Include physical ARKit capture sphere lens offset [dx, 0, dz] in station origin.",
     )
     parser.add_argument(
+        "--flip_x", "--flip-x",
+        dest="flip_x",
+        action="store_true",
+        default=False,
+        help="Multiply X world coordinate by -1 (reflect across X axis).",
+    )
+    parser.add_argument(
+        "--flip_y", "--flip-y",
+        dest="flip_y",
+        action="store_true",
+        default=False,
+        help="Multiply Y world coordinate by -1 (reflect across Y axis).",
+    )
+    parser.add_argument(
+        "--flip_z", "--flip-z",
+        dest="flip_z",
+        action="store_true",
+        default=False,
+        help="Multiply Z world coordinate by -1 (reflect across Z axis).",
+    )
+    parser.add_argument(
         "--run_reconstruction",
         action="store_true",
         help="Automatically run MapAnything reconstruction after processing.",
@@ -1040,6 +1087,9 @@ def main():
         anchor=args.anchor,
         no_normalize=args.no_normalize,
         include_sphere_offset=args.include_sphere_offset,
+        flip_x=args.flip_x,
+        flip_y=args.flip_y,
+        flip_z=args.flip_z,
     )
 
     if args.run_reconstruction:

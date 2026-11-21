@@ -170,5 +170,56 @@ def test_dense_flag_cli_parsing():
                     assert call_kwargs["voxel_size"] is None
 
 
+def test_apply_pose_flips():
+    from scripts.reconstruct_from_posed_images import apply_pose_flips
+
+    # Create dummy 4x4 cam2world pose
+    R = np.array([
+        [-0.68745, 0.0, -0.72623],
+        [0.0, 1.0, 0.0],
+        [0.72623, 0.0, -0.68745],
+    ], dtype=np.float32)
+    t = np.array([-5.511, -1.059, 7.212], dtype=np.float32)
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R
+    pose[:3, 3] = t
+
+    # 1. Flip X
+    p_fx = apply_pose_flips([pose], flip_x=True)[0]
+    assert pytest.approx(p_fx[0, 3], abs=1e-4) == 5.511
+    assert pytest.approx(p_fx[1, 3], abs=1e-4) == -1.059
+    assert pytest.approx(p_fx[2, 3], abs=1e-4) == 7.212
+    assert pytest.approx(float(np.linalg.det(p_fx[:3, :3])), abs=1e-5) == 1.0
+
+    # 2. Flip Y
+    p_fy = apply_pose_flips([pose], flip_y=True)[0]
+    assert pytest.approx(p_fy[0, 3], abs=1e-4) == -5.511
+    assert pytest.approx(p_fy[1, 3], abs=1e-4) == 1.059
+    assert pytest.approx(p_fy[2, 3], abs=1e-4) == 7.212
+    assert pytest.approx(float(np.linalg.det(p_fy[:3, :3])), abs=1e-5) == 1.0
+
+    # 3. Flip Z
+    p_fz = apply_pose_flips([pose], flip_z=True)[0]
+    assert pytest.approx(p_fz[0, 3], abs=1e-4) == -5.511
+    assert pytest.approx(p_fz[1, 3], abs=1e-4) == -1.059
+    assert pytest.approx(p_fz[2, 3], abs=1e-4) == -7.212
+    assert pytest.approx(float(np.linalg.det(p_fz[:3, :3])), abs=1e-5) == 1.0
+
+
+def test_multi_flip_outputs_cli_parsing():
+    from scripts.reconstruct_from_posed_images import main
+    import unittest.mock as mock
+
+    test_args = ["reconstruct_from_posed_images.py", "--images", "dummy_dir", "--multi-flip-outputs"]
+    with mock.patch("sys.argv", test_args):
+        with mock.patch("scripts.reconstruct_from_posed_images.reconstruct_from_posed_images") as mock_recon:
+            with mock.patch("scripts.reconstruct_from_posed_images.find_images", return_value=(["dummy.jpg"], ["dummy.jpg"])):
+                with mock.patch("scripts.reconstruct_from_posed_images.load_poses", return_value=[np.eye(4)]):
+                    main()
+                    assert mock_recon.called
+                    call_kwargs = mock_recon.call_args[1]
+                    assert call_kwargs["multi_flip_outputs"] is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

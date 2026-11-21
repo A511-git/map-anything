@@ -157,6 +157,37 @@ def convert_pose_convention(pose: np.ndarray, from_convention: str = "opencv") -
         )
 
 
+def apply_pose_flips(
+    poses: List[np.ndarray],
+    flip_x: bool = False,
+    flip_y: bool = False,
+    flip_z: bool = False,
+) -> List[np.ndarray]:
+    """
+    Reflect camera poses across selected world axes while strictly preserving SO(3) rotation validity (det = +1.0).
+    - flip_x: Negates X coordinate (transversal / east-west)
+    - flip_y: Negates Y coordinate (vertical / elevation)
+    - flip_z: Negates Z coordinate (longitudinal / north-south)
+    """
+    if not (flip_x or flip_y or flip_z):
+        return poses
+
+    sx = -1.0 if flip_x else 1.0
+    sy = -1.0 if flip_y else 1.0
+    sz = -1.0 if flip_z else 1.0
+    S = np.diag([sx, sy, sz]).astype(np.float32)
+
+    flipped = []
+    for p in poses:
+        p_new = np.array(p, dtype=np.float32).copy()
+        # Reflect 3D translation
+        p_new[:3, 3] = S @ p_new[:3, 3]
+        # Conjugate rotation to keep det(R') = det(S)*det(R)*det(S) = (-1)*(+1)*(-1) = +1.0
+        p_new[:3, :3] = S @ p_new[:3, :3] @ S
+        flipped.append(p_new)
+    return flipped
+
+
 def _parse_jobdata_poses(
     content: list,
     image_filenames: Optional[List[str]] = None,
@@ -1032,6 +1063,10 @@ def reconstruct_from_posed_images(
     pano_yaw_offset: float = 0.0,
     no_normalize: bool = False,
     include_sphere_offset: bool = False,
+    flip_x: bool = False,
+    flip_y: bool = False,
+    flip_z: bool = False,
+    multi_flip_outputs: bool = False,
     cache_dir: Optional[Union[str, Path]] = None,
     # Camera visualization options:
     add_camera_markers: bool = True,
@@ -1092,6 +1127,9 @@ def reconstruct_from_posed_images(
                 anchor=anchor,
                 no_normalize=no_normalize,
                 include_sphere_offset=include_sphere_offset,
+                flip_x=flip_x,
+                flip_y=flip_y,
+                flip_z=flip_z,
                 verbose=verbose,
             )
             pano_res = res
@@ -1169,6 +1207,11 @@ def reconstruct_from_posed_images(
         loaded_poses = [convert_pose_convention(p, pose_convention) for p in poses]
     else:
         raise ValueError(f"Unsupported type for poses: {type(poses)}")
+
+    if (flip_x or flip_y or flip_z) and pano_res is None:
+        loaded_poses = apply_pose_flips(loaded_poses, flip_x=flip_x, flip_y=flip_y, flip_z=flip_z)
+        if verbose:
+            print(f"[Pose Flip] Applied coordinate flips (flip_x={flip_x}, flip_y={flip_y}, flip_z={flip_z}) to loaded poses.")
 
     if not model_decides_face_poses and len(loaded_poses) != num_views:
         raise ValueError(f"Mismatch between number of images ({num_views}) and poses ({len(loaded_poses)})")
@@ -1399,6 +1442,61 @@ def reconstruct_from_posed_images(
             dense=dense,
         )
 
+        # Multi-Flip Outputs: generate 3 combo outputs (-X, -Y, -Z)
+        if multi_flip_outputs and outputs is not None:
+            out_base_dir = Path(resolved_output_path).parent
+            flip_combos = [
+                ("flip_x", True, False, False),
+                ("flip_y", False, True, False),
+                ("flip_z", False, False, True),
+            ]
+            if verbose:
+                print(f"\n[Multi-Flip] Generating 3 combo outputs (-X, -Y, -Z) in: {out_base_dir}...")
+            for combo_name, fx, fy, fz in flip_combos:
+                combo_poses = apply_pose_flips(loaded_poses, flip_x=fx, flip_y=fy, flip_z=fz)
+                combo_points = []
+                combo_colors = []
+                for v_idx, pred in enumerate(outputs):
+                    depth_z = pred["depth_z"][0].squeeze(-1)
+                    intrinsics_view = pred["intrinsics"][0]
+                    mask = pred["mask"][0].squeeze(-1).bool()
+                    img_no_norm = pred["img_no_norm"][0]
+
+                    exact_pose_torch = torch.from_numpy(combo_poses[v_idx]).to(device=depth_z.device, dtype=depth_z.dtype)
+                    pts3d_world, valid_depth = depthmap_to_world_frame(depth_z, intrinsics_view, exact_pose_torch)
+                    valid_mask = mask & valid_depth
+                    if max_depth is not None and max_depth > 0:
+                        valid_mask = valid_mask & (depth_z <= max_depth)
+
+                    valid_mask_np = valid_mask.cpu().numpy()
+                    pts_np = pts3d_world.cpu().numpy()[valid_mask_np]
+                    rgb_np = (img_no_norm.cpu().numpy()[valid_mask_np] * 255.0).clip(0, 255).astype(np.uint8)
+                    if len(pts_np) > 0:
+                        combo_points.append(pts_np)
+                        combo_colors.append(rgb_np)
+
+                if combo_points:
+                    c_pts = np.concatenate(combo_points, axis=0)
+                    c_rgb = np.concatenate(combo_colors, axis=0)
+                    combo_markers = None
+                    if add_camera_markers and combo_poses:
+                        c_marker_pts, c_marker_rgb = generate_camera_markers(
+                            combo_poses, radius=marker_radius, marker_style=marker_style
+                        )
+                        combo_markers = (c_marker_pts, c_marker_rgb)
+
+                    combo_ply_path = str(out_base_dir / combo_name / "pointcloud.ply")
+                    export_point_cloud(
+                        output_path=combo_ply_path,
+                        points=c_pts,
+                        colors=c_rgb,
+                        voxel_size=voxel_size,
+                        camera_markers=combo_markers,
+                        dense=dense,
+                    )
+                    if verbose:
+                        print(f"[Multi-Flip Output] Generated Combo {combo_name.upper()}: {combo_ply_path}")
+
     return combined_points, combined_colors
 
 
@@ -1619,6 +1717,34 @@ def main():
         default=False,
         help="Let the MapAnything model estimate the relative camera pose of each perspective face within a panorama, while anchoring the panorama as a whole using the provided global ARKit/GPS pose.",
     )
+    parser.add_argument(
+        "--flip_x", "--flip-x",
+        dest="flip_x",
+        action="store_true",
+        default=False,
+        help="Multiply camera pose X coordinate by -1 (reflect across X).",
+    )
+    parser.add_argument(
+        "--flip_y", "--flip-y",
+        dest="flip_y",
+        action="store_true",
+        default=False,
+        help="Multiply camera pose Y coordinate by -1 (reflect across Y).",
+    )
+    parser.add_argument(
+        "--flip_z", "--flip-z",
+        dest="flip_z",
+        action="store_true",
+        default=False,
+        help="Multiply camera pose Z coordinate by -1 (reflect across Z).",
+    )
+    parser.add_argument(
+        "--multi_flip_outputs", "--multi-flip-outputs", "--all-flips", "--three-flips",
+        dest="multi_flip_outputs",
+        action="store_true",
+        default=False,
+        help="Generate 3 combo point cloud outputs (-X, -Y, -Z axis reflections) in one run.",
+    )
 
     args = parser.parse_args()
 
@@ -1662,6 +1788,10 @@ def main():
         pano_yaw_offset=args.pano_yaw_offset,
         no_normalize=args.no_normalize,
         include_sphere_offset=args.include_sphere_offset,
+        flip_x=args.flip_x,
+        flip_y=args.flip_y,
+        flip_z=args.flip_z,
+        multi_flip_outputs=args.multi_flip_outputs,
         cache_dir=args.cache_dir,
         add_camera_markers=args.add_camera_markers,
         marker_radius=args.marker_radius,

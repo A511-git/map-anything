@@ -677,5 +677,63 @@ def test_mathematical_consistency_and_spatial_alignment():
         np.testing.assert_allclose(reconstructed_p0, reconstructed_p1, atol=1e-5)
 
 
+def test_axis_flips_and_so3_validity():
+    """
+    Test that flip_x, flip_y, and flip_z correctly negate translations and preserve SO(3) det=+1.0 rotations.
+    """
+    records = [
+        {
+            "origin_arkit": np.array([-5.511, -1.059, 7.212], dtype=np.float32),
+            "magnetic_heading_deg": 133.4,
+            "image_path": Path("pano0.jpg"),
+            "json_path": Path("meta0.json"),
+        },
+        {
+            "origin_arkit": np.array([-5.992, -0.972, 9.631], dtype=np.float32),
+            "magnetic_heading_deg": 42.8,
+            "image_path": Path("pano1.jpg"),
+            "json_path": Path("meta1.json"),
+        },
+    ]
+
+    # 1. Flip X in unnormalized ARKit mode
+    panos_fx = compute_level1_normalized_poses(records, no_normalize=True, flip_x=True)
+    assert len(panos_fx) == 2
+    t0_fx = panos_fx[0]["t_pano_relative"]
+    t1_fx = panos_fx[1]["t_pano_relative"]
+    assert pytest.approx(t0_fx[0], abs=1e-4) == 5.511
+    assert pytest.approx(t1_fx[0], abs=1e-4) == 5.992
+    assert pytest.approx(t0_fx[1], abs=1e-4) == -1.059
+    assert pytest.approx(t0_fx[2], abs=1e-4) == 7.212
+    # Verify SO(3)
+    for p in panos_fx:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+    # 2. Flip Y in unnormalized ARKit mode
+    panos_fy = compute_level1_normalized_poses(records, no_normalize=True, flip_y=True)
+    t0_fy = panos_fy[0]["t_pano_relative"]
+    assert pytest.approx(t0_fy[0], abs=1e-4) == -5.511
+    assert pytest.approx(t0_fy[1], abs=1e-4) == 1.059
+    for p in panos_fy:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+    # 3. Flip Z in unnormalized ARKit mode
+    panos_fz = compute_level1_normalized_poses(records, no_normalize=True, flip_z=True)
+    t0_fz = panos_fz[0]["t_pano_relative"]
+    assert pytest.approx(t0_fz[0], abs=1e-4) == -5.511
+    assert pytest.approx(t0_fz[2], abs=1e-4) == -7.212
+    for p in panos_fz:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+    # 4. In normalized mode
+    panos_norm_fx = compute_level1_normalized_poses(records, no_normalize=False, flip_x=True)
+    for p in panos_norm_fx:
+        R = p["c2w_pano_4x4"][:3, :3]
+        assert pytest.approx(float(np.linalg.det(R)), abs=1e-5) == 1.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
