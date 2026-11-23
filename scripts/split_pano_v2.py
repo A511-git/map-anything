@@ -344,14 +344,14 @@ def main():
     )
     parser.add_argument(
         "--input", "-i",
-        type=str,
+        nargs="+",
         required=True,
         help="Path to folder containing panorama images or path to a single panorama file.",
     )
     parser.add_argument(
         "--output", "-o",
-        type=str,
-        default="output/cubemap_faces",
+        nargs="+",
+        default=["output/cubemap_faces"],
         help="Directory to save extracted face images and intrinsics (default: output/cubemap_faces).",
     )
     parser.add_argument(
@@ -374,12 +374,14 @@ def main():
     )
 
     args = parser.parse_args()
-    out_dir = Path(str(args.output).rstrip("/\\"))
-    dataset_name = get_dataset_name(args.input)
+    input_path = " ".join(args.input) if isinstance(args.input, list) else str(args.input)
+    output_path = " ".join(args.output) if isinstance(args.output, list) else str(args.output)
+    out_dir = Path(str(output_path).rstrip("/\\"))
+    dataset_name = get_dataset_name(input_path)
     if dataset_name.lower() not in [part.lower() for part in out_dir.parts]:
         out_dir = out_dir / dataset_name
     split_all_panoramas(
-        images_or_dir=args.input,
+        images_or_dir=input_path,
         output_dir=out_dir,
         face_size=args.face_size,
         fov_deg=args.fov,

@@ -367,8 +367,9 @@ def reconstruct_panorama_dataset(
 
     # 2. Extract Cubemap Perspective Faces
     cubemap_cache_dir = target_dir / "cubemap_faces"
+    unique_image_paths = list(dict.fromkeys([p["image_path"] for p in pano_poses if p.get("image_path")]))
     split_res = split_all_panoramas(
-        images_or_dir=[p["image_path"] for p in pano_poses if p["image_path"]],
+        images_or_dir=unique_image_paths,
         output_dir=cubemap_cache_dir,
         face_size=face_size,
         fov_deg=fov_deg,
@@ -439,7 +440,13 @@ def reconstruct_panorama_dataset(
 
     for p_idx, p_rec in enumerate(pano_poses):
         job_id = p_rec["jobId"]
-        img_name = p_rec["image_name"]
+        img_path = p_rec.get("image_path")
+        img_name = p_rec.get("image_name")
+        if not img_path or not img_name:
+            if verbose:
+                print(f"Skipping station {p_rec['index']} ('{job_id}'): no matching panorama image in input directory.")
+            continue
+
         stem = Path(img_name).stem
         T_pano = p_rec["c2w_matrix"]  # (4, 4) in OpenCV RDF
 
@@ -583,21 +590,21 @@ def main():
     )
     parser.add_argument(
         "--input", "-i",
-        type=str,
+        nargs="+",
         required=True,
         help="Path to folder containing panorama images and jobdata.json (e.g. 'jobdata').",
     )
     parser.add_argument(
         "--metadata", "--jobdata",
         dest="metadata",
-        type=str,
+        nargs="+",
         default=None,
         help="Optional explicit path to jobdata.json / metadata JSON if stored in a different directory from images.",
     )
     parser.add_argument(
         "--output", "-o",
-        type=str,
-        default="output/reconstruction_v2",
+        nargs="+",
+        default=["output/reconstruction_v2"],
         help="Output directory or point cloud file (.ply). Default: 'output/reconstruction_v2'.",
     )
     parser.add_argument(
@@ -720,16 +727,20 @@ def main():
     args = parser.parse_args()
     model_name = "facebook/map-anything-apache" if args.apache else "facebook/map-anything"
 
+    input_path = " ".join(args.input) if isinstance(args.input, list) else str(args.input)
+    metadata_path = " ".join(args.metadata) if isinstance(args.metadata, list) and args.metadata else (args.metadata if args.metadata else None)
+    output_path = " ".join(args.output) if isinstance(args.output, list) else str(args.output)
+
     if args.all_modes:
         modes = ["3d_distance", "horizontal_distance", "sphere_drift"]
-        _, base_target_dir = resolve_output_path(args.output, args.input)
+        _, base_target_dir = resolve_output_path(output_path, input_path)
         print(f"\n[Debugger] Running all 3 distance modes: {modes} under '{base_target_dir}'...")
         for mode in modes:
-            mode_ply_file, mode_target_dir = resolve_output_path(args.output, args.input, subfolder=mode)
+            mode_ply_file, mode_target_dir = resolve_output_path(output_path, input_path, subfolder=mode)
             print(f"\n{'='*70}\n[Debugger Mode] Executing mode: {mode.upper()} -> {mode_target_dir}\n{'='*70}")
             reconstruct_panorama_dataset(
-                input_path=args.input,
-                metadata_path=args.metadata,
+                input_path=input_path,
+                metadata_path=metadata_path,
                 output_path=mode_ply_file,
                 distance_mode=mode,
                 use_direct_origin=args.use_direct_origin,
@@ -754,10 +765,10 @@ def main():
         print(f"\n[Debugger Complete] All 3 modes exported successfully under: {base_target_dir}")
 
     else:
-        final_file, target_dir = resolve_output_path(args.output, args.input)
+        final_file, target_dir = resolve_output_path(output_path, input_path)
         reconstruct_panorama_dataset(
-            input_path=args.input,
-            metadata_path=args.metadata,
+            input_path=input_path,
+            metadata_path=metadata_path,
             output_path=final_file,
             distance_mode=args.distance_mode,
             use_direct_origin=args.use_direct_origin,

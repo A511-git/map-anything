@@ -416,6 +416,13 @@ def resolve_scan_chain_records(
     # Sort records by scan chain index
     sorted_records = sorted(raw_records, key=get_scan_idx)
 
+    # Check whether image filenames match record jobIds by stem
+    all_record_jids = {str(item.get("jobId", "")) for item in sorted_records if isinstance(item, dict)}
+    has_stem_matches = any(
+        stem in all_record_jids or cleaned in all_record_jids
+        for stem, cleaned in zip(img_by_stem.keys(), img_by_cleaned_stem.keys())
+    )
+
     resolved: List[Dict[str, Any]] = []
 
     for i, item in enumerate(sorted_records):
@@ -432,13 +439,12 @@ def resolve_scan_chain_records(
             matched_img = img_by_stem[jid]
         elif jid in img_by_cleaned_stem:
             matched_img = img_by_cleaned_stem[jid]
-        else:
-            # Fallback by index if images and records align
-            if i < len(image_paths):
-                matched_img = image_paths[i]
+        elif not has_stem_matches and len(image_paths) == len(sorted_records) and i < len(image_paths):
+            # Fallback by sequential index ONLY if no images match by stem and record count equals image count
+            matched_img = image_paths[i]
 
         rec["image_path"] = matched_img
-        rec["image_name"] = matched_img.name if matched_img else f"{jid}.jpg"
+        rec["image_name"] = matched_img.name if matched_img else None
 
         # Resolve terminal node only for the final station in the chain
         arkit = extract_arkit_dict(rec)
@@ -771,21 +777,21 @@ def main():
     )
     parser.add_argument(
         "--input", "-i",
-        type=str,
+        nargs="+",
         required=True,
         help="Path to folder containing jobdata.json and images, or path to jobdata.json itself.",
     )
     parser.add_argument(
         "--metadata", "--jobdata",
         dest="metadata",
-        type=str,
+        nargs="+",
         default=None,
         help="Optional explicit path to jobdata.json / metadata JSON if stored in a different directory from images.",
     )
     parser.add_argument(
         "--output", "-o",
-        type=str,
-        default="output/debug_poses",
+        nargs="+",
+        default=["output/debug_poses"],
         help="Directory to save poses.npy and poses_debug.json (default: output/debug_poses).",
     )
     parser.add_argument(
@@ -810,7 +816,11 @@ def main():
 
     args = parser.parse_args()
 
-    raw_records, images, jobdata_file = find_jobdata_and_images(args.input, metadata_path=args.metadata)
+    input_path = " ".join(args.input) if isinstance(args.input, list) else str(args.input)
+    metadata_path = " ".join(args.metadata) if isinstance(args.metadata, list) and args.metadata else (args.metadata if args.metadata else None)
+    output_path = " ".join(args.output) if isinstance(args.output, list) else str(args.output)
+
+    raw_records, images, jobdata_file = find_jobdata_and_images(input_path, metadata_path=metadata_path)
     print(f"Loaded {len(raw_records)} records from {jobdata_file.name} with {len(images)} matched image files.")
 
     resolved_records = resolve_scan_chain_records(raw_records, images)
@@ -822,8 +832,8 @@ def main():
         no_normalize_rotation=args.no_normalize_rotation,
     )
 
-    out_dir = Path(str(args.output).rstrip("/\\"))
-    dataset_name = get_dataset_name(args.input)
+    out_dir = Path(str(output_path).rstrip("/\\"))
+    dataset_name = get_dataset_name(input_path)
     if dataset_name.lower() not in [part.lower() for part in out_dir.parts]:
         out_dir = out_dir / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
