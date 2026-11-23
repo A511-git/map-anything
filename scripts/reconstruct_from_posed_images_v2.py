@@ -188,17 +188,70 @@ def generate_camera_markers(
     return np.concatenate(marker_pts, axis=0), np.concatenate(marker_rgb, axis=0)
 
 
+def write_binary_ply(
+    filepath: Union[str, Path],
+    points: np.ndarray,
+    colors: np.ndarray,
+) -> None:
+    """
+    Write point cloud directly to binary little-endian PLY format using pure NumPy.
+    Zero external dependencies (does not require Open3D or Trimesh).
+    Points: (N, 3) float32
+    Colors: (N, 3) uint8
+    Storage size: exactly 15 bytes per point (float32 x, y, z + uint8 r, g, b).
+    """
+    points = np.ascontiguousarray(points, dtype=np.float32)
+    colors = np.ascontiguousarray(colors, dtype=np.uint8)
+    num_pts = len(points)
+
+    ply_dtype = np.dtype([
+        ("x", "<f4"),
+        ("y", "<f4"),
+        ("z", "<f4"),
+        ("red", "u1"),
+        ("green", "u1"),
+        ("blue", "u1"),
+    ])
+
+    vertex_data = np.empty(num_pts, dtype=ply_dtype)
+    vertex_data["x"] = points[:, 0]
+    vertex_data["y"] = points[:, 1]
+    vertex_data["z"] = points[:, 2]
+    vertex_data["red"] = colors[:, 0]
+    vertex_data["green"] = colors[:, 1]
+    vertex_data["blue"] = colors[:, 2]
+
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {num_pts}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+
+    with open(filepath, "wb") as f:
+        f.write(header)
+        vertex_data.tofile(f)
+
+
 def export_point_cloud(
     output_path: str,
     points: np.ndarray,
     colors: np.ndarray,
-    voxel_size: Optional[float] = None,
+    voxel_size: Optional[float] = 0.01,
     camera_markers: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     dense: bool = False,
     verbose: bool = True,
 ) -> None:
     """
-    Save 3D point cloud to .ply format with optional voxel downsampling.
+    Save 3D point cloud strictly as binary little-endian .ply format with optional voxel downsampling.
+    Default voxel_size is 0.01 (1cm grid) which compresses 20M raw points down to ~3.5M points (~50 MB).
+    Use dense=True to export all points without downsampling.
     """
     out_dir = Path(output_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -208,8 +261,8 @@ def export_point_cloud(
         if verbose:
             print(f"Full dense mode: preserving all {len(points):,} points without downsampling.")
 
-    # Apply voxel downsampling if requested
-    if voxel_size is not None and voxel_size > 0:
+    # Apply voxel downsampling (default 0.01m = 1cm)
+    if voxel_size is not None and voxel_size > 0 and len(points) > 0:
         if verbose:
             print(f"Applying voxel downsampling (voxel_size = {voxel_size:.4f} m)...")
         try:
@@ -222,15 +275,17 @@ def export_point_cloud(
             colors = (np.asarray(pcd_down.colors) * 255.0).clip(0, 255).astype(np.uint8)
             if verbose:
                 print(f"Point count reduced to {len(points):,} points.")
-        except ImportError:
-            coords = np.floor(points / voxel_size).astype(np.int64)
-            _, unique_indices = np.unique(coords, axis=0, return_index=True)
+        except Exception:
+            # Fast pure NumPy voxel grid
+            coords = np.floor(points / voxel_size).astype(np.int32)
+            coords_view = np.ascontiguousarray(coords).view(np.dtype((np.void, coords.dtype.itemsize * 3)))
+            _, unique_indices = np.unique(coords_view, return_index=True)
             points = points[unique_indices]
             colors = colors[unique_indices]
             if verbose:
                 print(f"NumPy voxel grid reduced point count to {len(points):,} points.")
 
-    # Append camera markers after downsampling
+    # Append camera markers after downsampling so markers remain sharp and dense
     if camera_markers is not None:
         m_pts, m_colors = camera_markers
         if len(m_pts) > 0:
@@ -243,27 +298,11 @@ def export_point_cloud(
     if not output_path.lower().endswith(".ply"):
         output_path = os.path.splitext(output_path)[0] + ".ply"
 
-    # Save to PLY format (Open3D binary or clean ASCII fallback)
-    try:
-        import open3d as o3d
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
-        o3d.io.write_point_cloud(output_path, pcd, write_ascii=False)
-        if verbose:
-            print(f"Saved binary PLY point cloud to: {output_path}")
-    except Exception:
-        # Fallback ASCII PLY
-        with open(output_path, "w", encoding="ascii") as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(points)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-            f.write("end_header\n")
-            for pt, col in zip(points, colors):
-                f.write(f"{pt[0]:.4f} {pt[1]:.4f} {pt[2]:.4f} {int(col[0])} {int(col[1])} {int(col[2])}\n")
-        if verbose:
-            print(f"Saved ASCII PLY point cloud to: {output_path}")
+    # Always write binary PLY (never ASCII!)
+    write_binary_ply(output_path, points, colors)
+    if verbose:
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"Saved binary PLY point cloud ({size_mb:.2f} MB, {len(points):,} points) to: {output_path}")
 
 
 def reconstruct_panorama_dataset(
@@ -275,7 +314,7 @@ def reconstruct_panorama_dataset(
     no_normalize_rotation: bool = False,
     face_size: int = 1024,
     fov_deg: float = 100.0,
-    voxel_size: Optional[float] = None,
+    voxel_size: Optional[float] = 0.01,
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     use_multiview_confidence: bool = False,
@@ -601,8 +640,8 @@ def main():
     parser.add_argument(
         "--voxel_size",
         type=float,
-        default=None,
-        help="Optional voxel downsampling grid size in meters (e.g. 0.01 for 1cm grid).",
+        default=0.01,
+        help="Voxel downsampling grid size in meters (default: 0.01 for 1cm grid, keeps file size ~50 MB). Use --dense to disable.",
     )
     parser.add_argument(
         "--dense",

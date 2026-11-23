@@ -84,17 +84,41 @@ def natural_sort_key(s: Union[str, Path]) -> list:
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", str(s))]
 
 
+def safe_parse_json(val: Any) -> Any:
+    """Safely parse a JSON-encoded string, or return the original value if not a valid JSON string."""
+    if isinstance(val, str):
+        s = val.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+    return val
+
+
 def extract_arkit_dict(rec: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extract and normalize ARKit fields whether nested inside 'arKitData'
-    or present directly at the top level of the record dictionary.
+    Extract and normalize ARKit fields whether nested inside 'arKitData',
+    serialized as JSON strings, or present directly at top-level.
     """
-    arkit = rec.get("arKitData")
     d: Dict[str, Any] = {}
-    if isinstance(arkit, dict) and arkit:
-        d = dict(arkit)
 
-    # Top-level fallback for all standard ARKit fields
+    # 1. Parse arKitData (handling dict or serialized JSON string)
+    arkit = safe_parse_json(rec.get("arKitData"))
+    if isinstance(arkit, dict):
+        d.update(arkit)
+
+    # 2. Check arkitCapture.sphere
+    cap = safe_parse_json(rec.get("arkitCapture"))
+    if isinstance(cap, dict):
+        sph = safe_parse_json(cap.get("sphere"))
+        if isinstance(sph, dict):
+            if "headingAtPlace" in sph and (d.get("originHeading") is None or float(d.get("originHeading") or 0.0) == 0.0):
+                d["originHeading"] = sph["headingAtPlace"]
+            if "origin" in sph and d.get("origin") is None:
+                d["origin"] = sph["origin"]
+
+    # 3. Top-level fallback for all standard ARKit fields
     for k in [
         "origin", "destination", "vector", "distanceMeters",
         "horizontalDistanceMeters", "originPose", "destinationPose",
@@ -103,48 +127,123 @@ def extract_arkit_dict(rec: Dict[str, Any]) -> Dict[str, Any]:
         if (k not in d or d[k] is None) and k in rec and rec[k] is not None:
             d[k] = rec[k]
 
+    # Deserialize sub-objects if stored as JSON strings
+    for k in ["origin", "destination", "vector", "originPose", "destinationPose"]:
+        if k in d:
+            d[k] = safe_parse_json(d[k])
+
     # Heading alternatives
-    if "originHeading" not in d or d["originHeading"] is None:
+    if d.get("originHeading") is None or float(d.get("originHeading") or 0.0) == 0.0:
         for hk in ["originHeading", "headingAtPlace", "magneticHeading", "magnetic_heading_deg", "heading"]:
-            if hk in rec and rec[hk] is not None:
-                d["originHeading"] = rec[hk]
+            val = rec.get(hk) or (arkit.get(hk) if isinstance(arkit, dict) else None)
+            if val is not None and float(val) != 0.0:
+                d["originHeading"] = float(val)
                 break
-            if isinstance(rec.get("arkitCapture"), dict) and isinstance(rec["arkitCapture"].get("sphere"), dict):
-                sph_h = rec["arkitCapture"]["sphere"].get("headingAtPlace")
-                if sph_h is not None:
-                    d["originHeading"] = sph_h
-                    break
 
     # Origin alternatives
-    if "origin" not in d or d["origin"] is None:
-        if "origin_arkit_xyz" in rec and rec["origin_arkit_xyz"] is not None:
-            d["origin"] = rec["origin_arkit_xyz"]
-        elif "position" in rec and rec["position"] is not None:
-            d["origin"] = rec["position"]
-        elif isinstance(rec.get("arkitCapture"), dict) and isinstance(rec["arkitCapture"].get("sphere"), dict):
-            sph_o = rec["arkitCapture"]["sphere"].get("origin")
-            if sph_o is not None:
-                d["origin"] = sph_o
+    if d.get("origin") is None:
+        for ok in ["origin", "origin_arkit_xyz", "position", "position_xyz"]:
+            val = rec.get(ok) or (arkit.get(ok) if isinstance(arkit, dict) else None)
+            if val is not None:
+                d["origin"] = safe_parse_json(val)
+                break
+
+    # Distance alternatives
+    if d.get("distanceMeters") is None or float(d.get("distanceMeters") or 0.0) == 0.0:
+        for dk in ["distanceMeters", "distance_meters", "distance", "dist_m", "dist", "step_distance"]:
+            val = rec.get(dk) or (arkit.get(dk) if isinstance(arkit, dict) else None)
+            if val is not None and float(val) > 0.0:
+                d["distanceMeters"] = float(val)
+                break
+
+    # Horizontal distance alternatives
+    if d.get("horizontalDistanceMeters") is None or float(d.get("horizontalDistanceMeters") or 0.0) == 0.0:
+        for hdk in ["horizontalDistanceMeters", "horizontal_distance_meters", "horizontalDistance", "horizontal_distance", "hdist"]:
+            val = rec.get(hdk) or (arkit.get(hdk) if isinstance(arkit, dict) else None)
+            if val is not None and float(val) > 0.0:
+                d["horizontalDistanceMeters"] = float(val)
+                break
+
+    # Derive distance from vector if distanceMeters is 0
+    if (d.get("distanceMeters") is None or float(d.get("distanceMeters") or 0.0) == 0.0) and d.get("vector") is not None:
+        v = d["vector"]
+        if isinstance(v, dict):
+            vec = np.array([float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0))], dtype=np.float32)
+        elif isinstance(v, (list, tuple)) and len(v) >= 3:
+            vec = np.array([float(v[0]), float(v[1]), float(v[2])], dtype=np.float32)
+        else:
+            vec = None
+        if vec is not None:
+            norm_v = float(np.linalg.norm(vec))
+            if norm_v > 1e-4:
+                d["distanceMeters"] = norm_v
+                if d.get("horizontalDistanceMeters") is None or float(d.get("horizontalDistanceMeters") or 0.0) == 0.0:
+                    d["horizontalDistanceMeters"] = float(np.linalg.norm([vec[0], vec[2]]))
+
+    # Derive distance from destination - origin if distanceMeters is 0
+    if (d.get("distanceMeters") is None or float(d.get("distanceMeters") or 0.0) == 0.0) and d.get("origin") is not None and d.get("destination") is not None:
+        o = d["origin"]
+        dest = d["destination"]
+        try:
+            ox = float(o.get("x", 0.0) if isinstance(o, dict) else o[0])
+            oy = float(o.get("y", 0.0) if isinstance(o, dict) else o[1])
+            oz = float(o.get("z", 0.0) if isinstance(o, dict) else o[2])
+            dx = float(dest.get("x", 0.0) if isinstance(dest, dict) else dest[0])
+            dy = float(dest.get("y", 0.0) if isinstance(dest, dict) else dest[1])
+            dz = float(dest.get("z", 0.0) if isinstance(dest, dict) else dest[2])
+            diff = np.array([dx - ox, dy - oy, dz - oz], dtype=np.float32)
+            norm_diff = float(np.linalg.norm(diff))
+            if norm_diff > 1e-4:
+                d["distanceMeters"] = norm_diff
+                if d.get("horizontalDistanceMeters") is None or float(d.get("horizontalDistanceMeters") or 0.0) == 0.0:
+                    d["horizontalDistanceMeters"] = float(np.linalg.norm([diff[0], diff[2]]))
+        except Exception:
+            pass
 
     return d
 
 
+def score_arkit_metadata(data: Any) -> float:
+    """Score ARKit metadata richness: rewards non-zero distance and full tracking fields."""
+    if isinstance(data, dict):
+        if "captures" in data and isinstance(data["captures"], list):
+            data = data["captures"]
+        elif "poses" in data and isinstance(data["poses"], list):
+            data = data["poses"]
+        else:
+            data = [data]
+    if not isinstance(data, list) or len(data) == 0:
+        return -1.0
+
+    score = 0.0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        arkit = extract_arkit_dict(item)
+        dist = float(arkit.get("distanceMeters") or 0.0)
+        hdist = float(arkit.get("horizontalDistanceMeters") or 0.0)
+        if dist > 0.0:
+            score += 20.0
+        if hdist > 0.0:
+            score += 10.0
+        if arkit.get("vector") is not None:
+            score += 5.0
+        if arkit.get("origin") is not None:
+            score += 3.0
+        if arkit.get("destination") is not None:
+            score += 3.0
+        if arkit.get("originPose") is not None:
+            score += 5.0
+        if arkit.get("originHeading") is not None and float(arkit.get("originHeading") or 0.0) != 0.0:
+            score += 2.0
+        if safe_parse_json(item.get("scanChain")) is not None:
+            score += 2.0
+    return score
+
+
 def is_valid_arkit_content(data: Any) -> bool:
     """Check if loaded JSON content contains true ARKit tracking data."""
-    sample = None
-    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-        sample = data[0]
-    elif isinstance(data, dict):
-        sample = data
-
-    if sample is None:
-        return False
-
-    keys_to_check = [
-        "arKitData", "originPose", "originHeading", "distanceMeters",
-        "horizontalDistanceMeters", "scanChain", "arkitCapture"
-    ]
-    return any(k in sample for k in keys_to_check)
+    return score_arkit_metadata(data) > 0.0
 
 
 def find_jobdata_and_images(
@@ -157,10 +256,8 @@ def find_jobdata_and_images(
     Searches:
     1. metadata_path if explicitly provided
     2. input_path itself if a .json file
-    3. input_path/jobdata.json, input_path.parent/jobdata.json
-    4. input_path/metadata.json, input_path.parent/metadata.json
-    5. Any .json in input_path or parent containing valid ARKit tracking data
-    6. Individual per-image JSON files (<image_stem>.json)
+    3. Evaluates all candidate metadata JSON files and picks the highest scoring tracking data
+    4. Individual per-image JSON files (<image_stem>.json)
     """
     input_p = Path(input_path)
     if not input_p.exists():
@@ -197,44 +294,41 @@ def find_jobdata_and_images(
     if jobdata_file is None and input_p.is_file() and input_p.suffix.lower() == ".json":
         jobdata_file = input_p
 
-    # 3. Check candidate aggregate files
+    # 3. Check candidate aggregate files and select the richest metadata
     if jobdata_file is None and input_p.is_dir():
-        candidates = [
+        cand_files = [
             input_p / "jobdata.json",
             input_p.parent / "jobdata.json",
             input_p / "metadata.json",
             input_p.parent / "metadata.json",
         ]
-        for cand in candidates:
+        all_json = list(input_p.glob("*.json")) + list(input_p.parent.glob("*.json"))
+        for jf in all_json:
+            if jf not in cand_files and jf.name.lower() not in ["poses.json", "cubemap_poses.json", "cubemap_manifest.json"]:
+                cand_files.append(jf)
+
+        best_cand = None
+        best_data = None
+        best_score = -1.0
+
+        for cand in cand_files:
             if cand.is_file():
                 try:
                     with open(cand, "r", encoding="utf-8") as f:
                         test_data = json.load(f)
-                    if is_valid_arkit_content(test_data):
-                        jobdata_file = cand
-                        raw_data = test_data
-                        break
+                    cand_score = score_arkit_metadata(test_data)
+                    if cand_score > best_score:
+                        best_score = cand_score
+                        best_cand = cand
+                        best_data = test_data
                 except Exception:
                     continue
 
-    # 4. Search any JSON in input_p or input_p.parent with valid ARKit tracking content
-    if jobdata_file is None and input_p.is_dir():
-        json_candidates = list(input_p.glob("*.json")) + list(input_p.parent.glob("*.json"))
-        for jf in json_candidates:
-            # Skip output manifests that do not contain raw ARKit tracking
-            if jf.name.lower() in ["poses.json", "cubemap_poses.json", "cubemap_manifest.json"]:
-                continue
-            try:
-                with open(jf, "r", encoding="utf-8") as f:
-                    test_data = json.load(f)
-                if is_valid_arkit_content(test_data):
-                    jobdata_file = jf
-                    raw_data = test_data
-                    break
-            except Exception:
-                continue
+        if best_cand is not None and best_score > 0.0:
+            jobdata_file = best_cand
+            raw_data = best_data
 
-    # 5. Check for per-image companion JSON files (<stem>.json)
+    # 4. Check for per-image companion JSON files (<stem>.json)
     if jobdata_file is None and input_p.is_dir():
         individual_records = []
         for img in images:
@@ -305,11 +399,22 @@ def resolve_scan_chain_records(
         for img in image_paths
     }
 
+    def get_scan_idx(item: Any) -> int:
+        if not isinstance(item, dict):
+            return 999999
+        sc = safe_parse_json(item.get("scanChain"))
+        if isinstance(sc, dict) and "index" in sc and sc["index"] is not None:
+            return int(sc["index"])
+        for k in ["scan_chain_index", "scanChainIndex", "chain_index", "index"]:
+            if k in item and item[k] is not None:
+                try:
+                    return int(item[k])
+                except Exception:
+                    pass
+        return 999999
+
     # Sort records by scan chain index
-    sorted_records = sorted(
-        raw_records,
-        key=lambda x: x.get("scanChain", {}).get("index", 999999) if isinstance(x, dict) else 999999
-    )
+    sorted_records = sorted(raw_records, key=get_scan_idx)
 
     resolved: List[Dict[str, Any]] = []
 
@@ -335,24 +440,27 @@ def resolve_scan_chain_records(
         rec["image_path"] = matched_img
         rec["image_name"] = matched_img.name if matched_img else f"{jid}.jpg"
 
-        # Resolve terminal node
+        # Resolve terminal node only for the final station in the chain
         arkit = extract_arkit_dict(rec)
         rec["arKitData"] = arkit
-        if not arkit.get("origin") and not arkit.get("vector") and i > 0:
+
+        is_last = (i == len(sorted_records) - 1)
+        is_terminal = (
+            rec.get("isTerminal") is True or
+            ((safe_parse_json(rec.get("scanChain")) or {}).get("nextSessionId") is None and is_last) or
+            (is_last and not arkit.get("destination") and not arkit.get("vector") and float(arkit.get("distanceMeters") or 0.0) == 0.0)
+        )
+        if is_terminal and is_last and i > 0:
             prev_arkit = extract_arkit_dict(resolved[i - 1])
             if prev_arkit:
-                rec["arKitData"] = {
-                    "origin": prev_arkit.get("destination"),
-                    "destination": None,
-                    "vector": None,
-                    "distanceMeters": 0.0,
-                    "horizontalDistanceMeters": 0.0,
-                    "originPose": prev_arkit.get("destinationPose"),
-                    "destinationPose": None,
-                    "originHeading": prev_arkit.get("destinationHeading"),
-                    "destinationHeading": None,
-                    "isTerminal": True,
-                }
+                if not arkit.get("origin") and prev_arkit.get("destination"):
+                    arkit["origin"] = prev_arkit.get("destination")
+                if not arkit.get("originPose") and prev_arkit.get("destinationPose"):
+                    arkit["originPose"] = prev_arkit.get("destinationPose")
+                if not arkit.get("originHeading") and prev_arkit.get("destinationHeading"):
+                    arkit["originHeading"] = prev_arkit.get("destinationHeading")
+                arkit["distanceMeters"] = 0.0
+                arkit["horizontalDistanceMeters"] = 0.0
                 rec["isTerminal"] = True
 
         resolved.append(rec)
@@ -507,6 +615,48 @@ def compute_panorama_poses(
             dist_3d = float(arkit.get("distanceMeters") or (np.linalg.norm(vec) if vec is not None else 0.0))
             dist_horiz = float(arkit.get("horizontalDistanceMeters") or dist_3d)
 
+            # If dist_3d is 0, attempt to calculate step vector and distance from next station's origin
+            if dist_3d < 1e-4 and i < num_stations - 1:
+                next_arkit = extract_arkit_dict(records[i + 1])
+                orig_next = next_arkit.get("origin")
+                if orig_data is not None and orig_next is not None:
+                    try:
+                        ox = float(orig_data.get("x", 0.0) if isinstance(orig_data, dict) else orig_data[0])
+                        oy = float(orig_data.get("y", 0.0) if isinstance(orig_data, dict) else orig_data[1])
+                        oz = float(orig_data.get("z", 0.0) if isinstance(orig_data, dict) else orig_data[2])
+                        nx = float(orig_next.get("x", 0.0) if isinstance(orig_next, dict) else orig_next[0])
+                        ny = float(orig_next.get("y", 0.0) if isinstance(orig_next, dict) else orig_next[1])
+                        nz = float(orig_next.get("z", 0.0) if isinstance(orig_next, dict) else orig_next[2])
+                        vec_step = np.array([nx - ox, ny - oy, nz - oz], dtype=np.float32)
+                        dist_step = float(np.linalg.norm(vec_step))
+                        if dist_step > 1e-4:
+                            vec = vec_step
+                            dist_3d = dist_step
+                            dist_horiz = float(np.linalg.norm([vec_step[0], vec_step[2]]))
+                            arkit["distanceMeters"] = dist_3d
+                            arkit["horizontalDistanceMeters"] = dist_horiz
+                    except Exception:
+                        pass
+
+            # If still 0, check translation difference from originPose
+            if dist_3d < 1e-4 and i < num_stations - 1:
+                pose_curr = arkit.get("originPose")
+                pose_next = extract_arkit_dict(records[i + 1]).get("originPose")
+                if pose_curr and pose_next and len(pose_curr) == 16 and len(pose_next) == 16:
+                    try:
+                        t_curr = np.array([pose_curr[12], pose_curr[13], pose_curr[14]], dtype=np.float32)
+                        t_next = np.array([pose_next[12], pose_next[13], pose_next[14]], dtype=np.float32)
+                        vec_step = t_next - t_curr
+                        dist_step = float(np.linalg.norm(vec_step))
+                        if dist_step > 1e-4:
+                            vec = vec_step
+                            dist_3d = dist_step
+                            dist_horiz = float(np.linalg.norm([vec_step[0], vec_step[2]]))
+                            arkit["distanceMeters"] = dist_3d
+                            arkit["horizontalDistanceMeters"] = dist_horiz
+                    except Exception:
+                        pass
+
             # Determine step vector
             if vec is not None and np.linalg.norm(vec) > 1e-6:
                 if distance_mode == "horizontal_distance":
@@ -548,13 +698,12 @@ def compute_panorama_poses(
 
     # Validation check: Ensure the dataset contains real ARKit motion/data
     has_any_dist = any(float(extract_arkit_dict(r).get("distanceMeters") or 0.0) > 0.0 for r in records[:-1])
-    has_any_heading = any(float(extract_arkit_dict(r).get("originHeading") or 0.0) != 0.0 for r in records)
     has_any_pos = any(not np.allclose(p, 0.0) for p in positions[1:])
 
-    if not has_any_dist and not has_any_heading and not has_any_pos and len(records) > 1:
+    if not has_any_dist and not has_any_pos and len(records) > 1:
         raise ValueError(
-            f"\n[CRITICAL ERROR] All {len(records)} stations were loaded with 0.0m distance, 0.0° heading, and [0, 0, 0] position!\n"
-            f"This occurs when the loaded metadata does NOT contain raw ARKit tracking data (e.g. an empty output poses.json was loaded instead of jobdata.json).\n"
+            f"\n[CRITICAL ERROR] All {len(records)} stations were loaded with 0.0m distance and [0, 0, 0] position!\n"
+            f"The loaded metadata does NOT contain valid distances or camera positions.\n"
             f"Please ensure jobdata.json is provided via --metadata /path/to/jobdata.json"
         )
 
@@ -566,12 +715,22 @@ def compute_panorama_poses(
         c2w[:3, 3] = pos
 
         arkit = extract_arkit_dict(rec)
+        sc = safe_parse_json(rec.get("scanChain"))
+        sc_idx = sc.get("index") if isinstance(sc, dict) else None
+        if sc_idx is None:
+            for k in ["scan_chain_index", "scanChainIndex", "chain_index"]:
+                if k in rec and rec[k] is not None:
+                    sc_idx = rec[k]
+                    break
+        if sc_idx is None:
+            sc_idx = idx + 1
+
         out_item = {
             "index": idx,
             "jobId": rec.get("jobId"),
             "image_name": rec.get("image_name"),
             "image_path": str(rec.get("image_path")) if rec.get("image_path") else None,
-            "scan_chain_index": rec.get("scanChain", {}).get("index", idx + 1),
+            "scan_chain_index": sc_idx,
             "distance_mode": distance_mode,
             "position_xyz": [round(float(v), 5) for v in pos],
             "distanceMeters": float(arkit.get("distanceMeters") or 0.0),
