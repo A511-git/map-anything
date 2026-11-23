@@ -33,6 +33,20 @@ import numpy as np
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 
 
+def get_dataset_name(input_path: Union[str, Path]) -> str:
+    """
+    Extract the clean dataset directory name from an input path or file.
+    E.g. '/kaggle/input/custom-mapanything-data/AR_kit' -> 'AR_kit'
+         'jobdata/jobdata.json' -> 'jobdata'
+    """
+    p = Path(str(input_path).rstrip("/\\"))
+    if p.suffix.lower() in [".json", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".heif"]:
+        name = p.parent.name
+    else:
+        name = p.name
+    return name if name else "reconstruction"
+
+
 def natural_sort_key(s: Union[str, Path]) -> list:
     """Natural numerical sorting key (e.g. frame_2 comes before frame_10)."""
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", str(s))]
@@ -360,9 +374,13 @@ def main():
     )
 
     args = parser.parse_args()
+    out_dir = Path(str(args.output).rstrip("/\\"))
+    dataset_name = get_dataset_name(args.input)
+    if dataset_name.lower() not in [part.lower() for part in out_dir.parts]:
+        out_dir = out_dir / dataset_name
     split_all_panoramas(
         images_or_dir=args.input,
-        output_dir=args.output,
+        output_dir=out_dir,
         face_size=args.face_size,
         fov_deg=args.fov,
         jpeg_quality=args.quality,

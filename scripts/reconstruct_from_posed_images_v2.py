@@ -20,7 +20,7 @@ Core Architecture:
    - Horizontal orientation rings (XZ plane)
    - Sight rays along the optical axes color-coded sequentially along the trajectory
 5. Output Export:
-   - Supports .pcd and .ply formats with optional voxel downsampling or full dense point cloud (--dense)
+   - Exports clean, high-performance binary .ply point clouds with optional voxel downsampling or full dense point cloud (--dense)
    - Supports --all_modes flag to generate comparison point clouds across all 3 distance modes side-by-side
 """
 
@@ -49,6 +49,8 @@ try:
     from scripts.arkit_pose_handler_v2 import (
         compute_panorama_poses,
         find_jobdata_and_images,
+        get_dataset_name,
+        resolve_output_path,
         resolve_scan_chain_records,
     )
     from scripts.split_pano_v2 import (
@@ -196,7 +198,7 @@ def export_point_cloud(
     verbose: bool = True,
 ) -> None:
     """
-    Save 3D point cloud to .pcd or .ply format with optional voxel downsampling.
+    Save 3D point cloud to .ply format with optional voxel downsampling.
     """
     out_dir = Path(output_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -237,44 +239,19 @@ def export_point_cloud(
             if verbose:
                 print(f"Appended {len(m_pts):,} camera marker points to output point cloud.")
 
-    ext = Path(output_path).suffix.lower()
+    # Ensure .ply extension
+    if not output_path.lower().endswith(".ply"):
+        output_path = os.path.splitext(output_path)[0] + ".ply"
 
-    if ext == ".pcd":
-        try:
-            import open3d as o3d
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
-            o3d.io.write_point_cloud(output_path, pcd, write_ascii=False)
-            if verbose:
-                print(f"Saved binary PCD point cloud to: {output_path}")
-            return
-        except ImportError:
-            # Fallback ASCII PCD
-            with open(output_path, "w", encoding="ascii") as f:
-                f.write("# .PCD v0.7 - Point Cloud Data\n")
-                f.write("VERSION 0.7\nFIELDS x y z rgb\nSIZE 4 4 4 4\nTYPE F F F U\nCOUNT 1 1 1 1\n")
-                f.write(f"WIDTH {len(points)}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {len(points)}\nDATA ascii\n")
-                rgb_packed = (
-                    (colors[:, 0].astype(np.uint32) << 16)
-                    | (colors[:, 1].astype(np.uint32) << 8)
-                    | (colors[:, 2].astype(np.uint32))
-                )
-                for pt, rgb_val in zip(points, rgb_packed):
-                    f.write(f"{pt[0]:.4f} {pt[1]:.4f} {pt[2]:.4f} {rgb_val}\n")
-            if verbose:
-                print(f"Saved ASCII PCD point cloud to: {output_path}")
-            return
-
-    # Default to PLY
+    # Save to PLY format (Open3D binary or clean ASCII fallback)
     try:
         import open3d as o3d
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
         pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
-        o3d.io.write_point_cloud(output_path, pcd)
+        o3d.io.write_point_cloud(output_path, pcd, write_ascii=False)
         if verbose:
-            print(f"Saved PLY point cloud to: {output_path}")
+            print(f"Saved binary PLY point cloud to: {output_path}")
     except Exception:
         # Fallback ASCII PLY
         with open(output_path, "w", encoding="ascii") as f:
@@ -291,6 +268,7 @@ def export_point_cloud(
 
 def reconstruct_panorama_dataset(
     input_path: Union[str, Path],
+    metadata_path: Optional[Union[str, Path]] = None,
     output_path: Union[str, Path] = "output/reconstruction_v2",
     distance_mode: str = "3d_distance",
     use_direct_origin: bool = False,
@@ -321,17 +299,13 @@ def reconstruct_panorama_dataset(
     4. Rigidly anchor local points and cameras to panorama pose with optical nodal center lock.
     5. Render camera markers and export point cloud.
     """
-    out_base = Path(output_path)
-    if out_base.suffix.lower() in [".pcd", ".ply"]:
-        final_ply_file = str(out_base)
-        target_dir = out_base.parent
-    else:
-        target_dir = out_base
-        final_ply_file = str(target_dir / "pointcloud.pcd")
+    final_ply_file, target_dir = resolve_output_path(output_path, input_path)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Parse ARKit Metadata & Pano Trajectory
-    raw_records, images, jobdata_file = find_jobdata_and_images(input_path)
+    raw_records, images, jobdata_file = find_jobdata_and_images(input_path, metadata_path=metadata_path)
+    if verbose:
+        print(f"\n[ARKit] Metadata source: {jobdata_file}")
     resolved_records = resolve_scan_chain_records(raw_records, images)
     pano_poses = compute_panorama_poses(
         resolved_records,
@@ -575,10 +549,17 @@ def main():
         help="Path to folder containing panorama images and jobdata.json (e.g. 'jobdata').",
     )
     parser.add_argument(
+        "--metadata", "--jobdata",
+        dest="metadata",
+        type=str,
+        default=None,
+        help="Optional explicit path to jobdata.json / metadata JSON if stored in a different directory from images.",
+    )
+    parser.add_argument(
         "--output", "-o",
         type=str,
         default="output/reconstruction_v2",
-        help="Output directory or point cloud file (.pcd / .ply). Default: 'output/reconstruction_v2'.",
+        help="Output directory or point cloud file (.ply). Default: 'output/reconstruction_v2'.",
     )
     parser.add_argument(
         "--distance_mode",
@@ -663,7 +644,7 @@ def main():
         "--dry_run",
         action="store_true",
         default=False,
-        help="Fast debugging mode: parses ARKit trajectory and exports camera markers PCD without running heavy neural inference.",
+        help="Fast debugging mode: parses ARKit trajectory and exports camera markers PLY without running heavy neural inference.",
     )
     parser.add_argument(
         "--apache",
@@ -702,13 +683,15 @@ def main():
 
     if args.all_modes:
         modes = ["3d_distance", "horizontal_distance", "sphere_drift"]
-        print(f"\n[Debugger] Running all 3 distance modes: {modes}...")
+        _, base_target_dir = resolve_output_path(args.output, args.input)
+        print(f"\n[Debugger] Running all 3 distance modes: {modes} under '{base_target_dir}'...")
         for mode in modes:
-            mode_output = Path(args.output) / mode / "pointcloud.pcd"
-            print(f"\n{'='*70}\n[Debugger Mode] Executing mode: {mode.upper()}\n{'='*70}")
+            mode_ply_file, mode_target_dir = resolve_output_path(args.output, args.input, subfolder=mode)
+            print(f"\n{'='*70}\n[Debugger Mode] Executing mode: {mode.upper()} -> {mode_target_dir}\n{'='*70}")
             reconstruct_panorama_dataset(
                 input_path=args.input,
-                output_path=mode_output,
+                metadata_path=args.metadata,
+                output_path=mode_ply_file,
                 distance_mode=mode,
                 use_direct_origin=args.use_direct_origin,
                 no_normalize_rotation=args.no_normalize_rotation,
@@ -729,12 +712,14 @@ def main():
                 dry_run=args.dry_run,
                 verbose=True,
             )
-        print(f"\n[Debugger Complete] All 3 modes exported successfully to: {args.output}")
+        print(f"\n[Debugger Complete] All 3 modes exported successfully under: {base_target_dir}")
 
     else:
+        final_file, target_dir = resolve_output_path(args.output, args.input)
         reconstruct_panorama_dataset(
             input_path=args.input,
-            output_path=args.output,
+            metadata_path=args.metadata,
+            output_path=final_file,
             distance_mode=args.distance_mode,
             use_direct_origin=args.use_direct_origin,
             no_normalize_rotation=args.no_normalize_rotation,

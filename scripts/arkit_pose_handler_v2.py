@@ -29,47 +29,252 @@ import numpy as np
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 
 
+def get_dataset_name(input_path: Union[str, Path]) -> str:
+    """
+    Extract the clean dataset directory name from an input path or file.
+    E.g. '/kaggle/input/custom-mapanything-data/AR_kit' -> 'AR_kit'
+         'jobdata/jobdata.json' -> 'jobdata'
+    """
+    p = Path(str(input_path).rstrip("/\\"))
+    if p.suffix.lower() in [".json", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".heif"]:
+        name = p.parent.name
+    else:
+        name = p.name
+    return name if name else "reconstruction"
+
+
+def resolve_output_path(
+    output_spec: Union[str, Path],
+    input_path: Union[str, Path],
+    subfolder: Optional[str] = None,
+    default_filename: str = "pointcloud.ply",
+) -> Tuple[str, Path]:
+    """
+    Resolve final point cloud file path and target folder.
+    
+    If output_spec does not already contain the dataset folder name (e.g. 'AR_kit'),
+    it nests it automatically:
+        'output' + 'AR_kit' -> 'output/AR_kit/pointcloud.ply'
+        'output' + 'AR_kit' + subfolder='3d_distance' -> 'output/AR_kit/3d_distance/pointcloud.ply'
+    """
+    dataset_name = get_dataset_name(input_path)
+    out_p = Path(str(output_spec).rstrip("/\\"))
+    
+    # Check if dataset_name is already in path components
+    already_contains = dataset_name.lower() in [part.lower() for part in out_p.parts]
+    
+    if out_p.suffix.lower() in [".ply", ".pcd"]:
+        fname = out_p.with_suffix(".ply").name
+        parent_dir = out_p.parent
+        target_dir = parent_dir if already_contains else (parent_dir / dataset_name)
+        if subfolder:
+            target_dir = target_dir / subfolder
+        final_file = target_dir / fname
+    else:
+        target_dir = out_p if already_contains else (out_p / dataset_name)
+        if subfolder:
+            target_dir = target_dir / subfolder
+        final_file = target_dir / default_filename
+        
+    return str(final_file), target_dir
+
+
 def natural_sort_key(s: Union[str, Path]) -> list:
     """Natural numerical sorting key (e.g. frame_2 comes before frame_10)."""
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", str(s))]
 
 
+def extract_arkit_dict(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract and normalize ARKit fields whether nested inside 'arKitData'
+    or present directly at the top level of the record dictionary.
+    """
+    arkit = rec.get("arKitData")
+    d: Dict[str, Any] = {}
+    if isinstance(arkit, dict) and arkit:
+        d = dict(arkit)
+
+    # Top-level fallback for all standard ARKit fields
+    for k in [
+        "origin", "destination", "vector", "distanceMeters",
+        "horizontalDistanceMeters", "originPose", "destinationPose",
+        "originHeading", "destinationHeading"
+    ]:
+        if (k not in d or d[k] is None) and k in rec and rec[k] is not None:
+            d[k] = rec[k]
+
+    # Heading alternatives
+    if "originHeading" not in d or d["originHeading"] is None:
+        for hk in ["originHeading", "headingAtPlace", "magneticHeading", "magnetic_heading_deg", "heading"]:
+            if hk in rec and rec[hk] is not None:
+                d["originHeading"] = rec[hk]
+                break
+            if isinstance(rec.get("arkitCapture"), dict) and isinstance(rec["arkitCapture"].get("sphere"), dict):
+                sph_h = rec["arkitCapture"]["sphere"].get("headingAtPlace")
+                if sph_h is not None:
+                    d["originHeading"] = sph_h
+                    break
+
+    # Origin alternatives
+    if "origin" not in d or d["origin"] is None:
+        if "origin_arkit_xyz" in rec and rec["origin_arkit_xyz"] is not None:
+            d["origin"] = rec["origin_arkit_xyz"]
+        elif "position" in rec and rec["position"] is not None:
+            d["origin"] = rec["position"]
+        elif isinstance(rec.get("arkitCapture"), dict) and isinstance(rec["arkitCapture"].get("sphere"), dict):
+            sph_o = rec["arkitCapture"]["sphere"].get("origin")
+            if sph_o is not None:
+                d["origin"] = sph_o
+
+    return d
+
+
+def is_valid_arkit_content(data: Any) -> bool:
+    """Check if loaded JSON content contains true ARKit tracking data."""
+    sample = None
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        sample = data[0]
+    elif isinstance(data, dict):
+        sample = data
+
+    if sample is None:
+        return False
+
+    keys_to_check = [
+        "arKitData", "originPose", "originHeading", "distanceMeters",
+        "horizontalDistanceMeters", "scanChain", "arkitCapture"
+    ]
+    return any(k in sample for k in keys_to_check)
+
+
 def find_jobdata_and_images(
-    input_path: Union[str, Path]
+    input_path: Union[str, Path],
+    metadata_path: Optional[Union[str, Path]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Path], Path]:
     """
-    Locate jobdata.json and associated panorama image files in input_path.
+    Locate jobdata.json (or companion per-image JSONs) and associated panorama image files.
 
-    Returns:
-        (records, image_paths, jobdata_file_path)
+    Searches:
+    1. metadata_path if explicitly provided
+    2. input_path itself if a .json file
+    3. input_path/jobdata.json, input_path.parent/jobdata.json
+    4. input_path/metadata.json, input_path.parent/metadata.json
+    5. Any .json in input_path or parent containing valid ARKit tracking data
+    6. Individual per-image JSON files (<image_stem>.json)
     """
     input_p = Path(input_path)
     if not input_p.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
-    if input_p.is_file() and input_p.suffix.lower() == ".json":
+    # Discover images
+    search_dir = input_p if input_p.is_dir() else input_p.parent
+    images = [
+        f for f in search_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS and not f.name.startswith(".")
+    ]
+    if not images and search_dir.parent.exists():
+        # Check subdirectories of search_dir (e.g. if images are in search_dir/images or search_dir/AR_kit)
+        for sub in search_dir.iterdir():
+            if sub.is_dir() and not sub.name.startswith("."):
+                sub_imgs = [f for f in sub.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS]
+                if sub_imgs:
+                    images.extend(sub_imgs)
+
+    images.sort(key=lambda x: natural_sort_key(x.name))
+    if not images:
+        raise FileNotFoundError(f"No panorama image files found in {input_path}")
+
+    jobdata_file = None
+    raw_data = None
+
+    # 1. Explicit metadata path
+    if metadata_path is not None:
+        m_p = Path(metadata_path)
+        if m_p.is_file():
+            jobdata_file = m_p
+
+    # 2. Input path is itself a JSON
+    if jobdata_file is None and input_p.is_file() and input_p.suffix.lower() == ".json":
         jobdata_file = input_p
-        search_dir = input_p.parent
-    elif input_p.is_dir():
+
+    # 3. Check candidate aggregate files
+    if jobdata_file is None and input_p.is_dir():
         candidates = [
             input_p / "jobdata.json",
+            input_p.parent / "jobdata.json",
             input_p / "metadata.json",
-            input_p / "poses.json",
+            input_p.parent / "metadata.json",
         ]
-        jobdata_file = next((c for c in candidates if c.is_file()), None)
-        if jobdata_file is None:
-            # Check any json in folder
-            json_files = [f for f in input_p.glob("*.json")]
-            if json_files:
-                jobdata_file = json_files[0]
-            else:
-                raise FileNotFoundError(f"No jobdata.json or metadata JSON found in: {input_p}")
-        search_dir = input_p
-    else:
-        raise ValueError(f"Invalid input path: {input_path}")
+        for cand in candidates:
+            if cand.is_file():
+                try:
+                    with open(cand, "r", encoding="utf-8") as f:
+                        test_data = json.load(f)
+                    if is_valid_arkit_content(test_data):
+                        jobdata_file = cand
+                        raw_data = test_data
+                        break
+                except Exception:
+                    continue
 
-    with open(jobdata_file, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
+    # 4. Search any JSON in input_p or input_p.parent with valid ARKit tracking content
+    if jobdata_file is None and input_p.is_dir():
+        json_candidates = list(input_p.glob("*.json")) + list(input_p.parent.glob("*.json"))
+        for jf in json_candidates:
+            # Skip output manifests that do not contain raw ARKit tracking
+            if jf.name.lower() in ["poses.json", "cubemap_poses.json", "cubemap_manifest.json"]:
+                continue
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    test_data = json.load(f)
+                if is_valid_arkit_content(test_data):
+                    jobdata_file = jf
+                    raw_data = test_data
+                    break
+            except Exception:
+                continue
+
+    # 5. Check for per-image companion JSON files (<stem>.json)
+    if jobdata_file is None and input_p.is_dir():
+        individual_records = []
+        for img in images:
+            img_stem = img.stem
+            cleaned_stem = re.sub(r"(_blurred|_pano|_equirectangular|_360)$", "", img_stem, flags=re.IGNORECASE)
+            companion = None
+            for cand_stem in [img_stem, cleaned_stem]:
+                c_file = input_p / f"{cand_stem}.json"
+                if c_file.is_file():
+                    companion = c_file
+                    break
+                p_file = input_p.parent / f"{cand_stem}.json"
+                if p_file.is_file():
+                    companion = p_file
+                    break
+            if companion is not None:
+                try:
+                    with open(companion, "r", encoding="utf-8") as f:
+                        c_data = json.load(f)
+                    if isinstance(c_data, list) and len(c_data) > 0:
+                        c_data = c_data[0]
+                    if isinstance(c_data, dict):
+                        if "jobId" not in c_data:
+                            c_data["jobId"] = img_stem
+                        individual_records.append(c_data)
+                except Exception:
+                    pass
+
+        if len(individual_records) >= len(images) * 0.5:
+            raw_data = individual_records
+            jobdata_file = input_p / "per_image_jsons"
+
+    if jobdata_file is None or raw_data is None:
+        if jobdata_file is not None and raw_data is None:
+            with open(jobdata_file, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+        else:
+            raise FileNotFoundError(
+                f"Could not find jobdata.json or valid ARKit metadata in: {input_path} or {input_path.parent}."
+            )
 
     if isinstance(raw_data, dict):
         if "captures" in raw_data and isinstance(raw_data["captures"], list):
@@ -81,13 +286,6 @@ def find_jobdata_and_images(
 
     if not isinstance(raw_data, list):
         raise ValueError(f"Expected a JSON list of records in {jobdata_file}")
-
-    # Discover images
-    images = [
-        f for f in search_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS and not f.name.startswith(".")
-    ]
-    images.sort(key=lambda x: natural_sort_key(x.name))
 
     return raw_data, images, jobdata_file
 
@@ -138,9 +336,10 @@ def resolve_scan_chain_records(
         rec["image_name"] = matched_img.name if matched_img else f"{jid}.jpg"
 
         # Resolve terminal node
-        arkit = rec.get("arKitData")
-        if arkit is None and i > 0:
-            prev_arkit = resolved[i - 1].get("arKitData")
+        arkit = extract_arkit_dict(rec)
+        rec["arKitData"] = arkit
+        if not arkit.get("origin") and not arkit.get("vector") and i > 0:
+            prev_arkit = extract_arkit_dict(resolved[i - 1])
             if prev_arkit:
                 rec["arKitData"] = {
                     "origin": prev_arkit.get("destination"),
@@ -227,7 +426,7 @@ def compute_panorama_poses(
     # 1. Compute raw Rotations for each station
     raw_rotations = []
     for rec in records:
-        arkit = rec.get("arKitData") or {}
+        arkit = extract_arkit_dict(rec)
         pose_list = arkit.get("originPose")
         heading = arkit.get("originHeading")
         R_cv = parse_arkit_rotation_matrix(pose_list, heading_deg=heading)
@@ -250,7 +449,7 @@ def compute_panorama_poses(
     if use_direct_origin:
         # Direct Origin Mode: extract arKitData.origin [x, y, z] directly
         for i, rec in enumerate(records):
-            arkit = rec.get("arKitData") or {}
+            arkit = extract_arkit_dict(rec)
             orig = arkit.get("origin")
             if orig is not None:
                 if isinstance(orig, dict):
@@ -283,7 +482,7 @@ def compute_panorama_poses(
 
         for i in range(num_stations - 1):
             rec = records[i]
-            arkit = rec.get("arKitData") or {}
+            arkit = extract_arkit_dict(rec)
 
             # Direction vector from origin to destination
             vec_data = arkit.get("vector")
@@ -347,6 +546,18 @@ def compute_panorama_poses(
     if not no_normalize_rotation and len(positions) > 0:
         positions = [R0.T @ p for p in positions]
 
+    # Validation check: Ensure the dataset contains real ARKit motion/data
+    has_any_dist = any(float(extract_arkit_dict(r).get("distanceMeters") or 0.0) > 0.0 for r in records[:-1])
+    has_any_heading = any(float(extract_arkit_dict(r).get("originHeading") or 0.0) != 0.0 for r in records)
+    has_any_pos = any(not np.allclose(p, 0.0) for p in positions[1:])
+
+    if not has_any_dist and not has_any_heading and not has_any_pos and len(records) > 1:
+        raise ValueError(
+            f"\n[CRITICAL ERROR] All {len(records)} stations were loaded with 0.0m distance, 0.0° heading, and [0, 0, 0] position!\n"
+            f"This occurs when the loaded metadata does NOT contain raw ARKit tracking data (e.g. an empty output poses.json was loaded instead of jobdata.json).\n"
+            f"Please ensure jobdata.json is provided via --metadata /path/to/jobdata.json"
+        )
+
     # 3. Assemble 4x4 cam2world matrices
     output_records = []
     for idx, (rec, R, pos) in enumerate(zip(records, final_rotations, positions)):
@@ -354,7 +565,7 @@ def compute_panorama_poses(
         c2w[:3, :3] = R
         c2w[:3, 3] = pos
 
-        arkit = rec.get("arKitData") or {}
+        arkit = extract_arkit_dict(rec)
         out_item = {
             "index": idx,
             "jobId": rec.get("jobId"),
@@ -386,6 +597,13 @@ def main():
         help="Path to folder containing jobdata.json and images, or path to jobdata.json itself.",
     )
     parser.add_argument(
+        "--metadata", "--jobdata",
+        dest="metadata",
+        type=str,
+        default=None,
+        help="Optional explicit path to jobdata.json / metadata JSON if stored in a different directory from images.",
+    )
+    parser.add_argument(
         "--output", "-o",
         type=str,
         default="output/debug_poses",
@@ -413,7 +631,7 @@ def main():
 
     args = parser.parse_args()
 
-    raw_records, images, jobdata_file = find_jobdata_and_images(args.input)
+    raw_records, images, jobdata_file = find_jobdata_and_images(args.input, metadata_path=args.metadata)
     print(f"Loaded {len(raw_records)} records from {jobdata_file.name} with {len(images)} matched image files.")
 
     resolved_records = resolve_scan_chain_records(raw_records, images)
@@ -425,7 +643,10 @@ def main():
         no_normalize_rotation=args.no_normalize_rotation,
     )
 
-    out_dir = Path(args.output)
+    out_dir = Path(str(args.output).rstrip("/\\"))
+    dataset_name = get_dataset_name(args.input)
+    if dataset_name.lower() not in [part.lower() for part in out_dir.parts]:
+        out_dir = out_dir / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Save poses.npy (N, 4, 4)
