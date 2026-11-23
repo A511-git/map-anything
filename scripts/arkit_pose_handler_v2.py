@@ -709,6 +709,8 @@ def compute_panorama_poses(
 
     # 3. Assemble 4x4 cam2world matrices
     output_records = []
+    has_full_arkit_data = any(safe_parse_json(r.get("arKitData")) is not None for r in records)
+
     for idx, (rec, R, pos) in enumerate(zip(records, final_rotations, positions)):
         c2w = np.eye(4, dtype=np.float32)
         c2w[:3, :3] = R
@@ -725,6 +727,17 @@ def compute_panorama_poses(
         if sc_idx is None:
             sc_idx = idx + 1
 
+        dist_val = float(arkit.get("distanceMeters") or 0.0)
+        hdist_val = float(arkit.get("horizontalDistanceMeters") or 0.0)
+
+        # Fallback: if distanceMeters was not in the metadata, calculate actual Euclidean step distance
+        if dist_val < 1e-4 and idx < num_stations - 1:
+            step_3d = float(np.linalg.norm(positions[idx + 1] - pos))
+            step_h = float(np.linalg.norm([positions[idx + 1][0] - pos[0], positions[idx + 1][2] - pos[2]]))
+            if step_3d > 1e-4:
+                dist_val = step_3d
+                hdist_val = step_h
+
         out_item = {
             "index": idx,
             "jobId": rec.get("jobId"),
@@ -733,14 +746,21 @@ def compute_panorama_poses(
             "scan_chain_index": sc_idx,
             "distance_mode": distance_mode,
             "position_xyz": [round(float(v), 5) for v in pos],
-            "distanceMeters": float(arkit.get("distanceMeters") or 0.0),
-            "horizontalDistanceMeters": float(arkit.get("horizontalDistanceMeters") or 0.0),
+            "distanceMeters": round(dist_val, 4),
+            "horizontalDistanceMeters": round(hdist_val, 4),
             "heading_deg": float(arkit.get("originHeading") or 0.0),
             "isTerminal": rec.get("isTerminal", False),
             "c2w_pose_4x4": c2w.tolist(),
             "c2w_matrix": c2w,
         }
         output_records.append(out_item)
+
+    if not has_full_arkit_data:
+        print(
+            "\n[ARKit Notice] Note: The loaded metadata does NOT contain 'arKitData' blocks (with global 'origin', 'destination', 'distanceMeters').\n"
+            "Positions and step distances were derived from 'arkitCapture.sphere.origin' (sub-meter lens offsets).\n"
+            "If you have the full jobdata.json containing 'arKitData', provide it via --metadata /path/to/jobdata.json for room-scale trajectory."
+        )
 
     return output_records
 
