@@ -247,6 +247,127 @@ def get_intrinsics_matrix(face_size: int, fov_deg: float = 90.0) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def sample_face_depth(
+    equirect_depth: np.ndarray,
+    face: str,
+    face_size: int,
+    fov_deg: float = 90.0,
+) -> np.ndarray:
+    """
+    Bilinear sample of one cubemap perspective depth face from an equirectangular depth map,
+    converting spherical radial distance r to camera planar Z-depth in OpenCV RDF frame (+Z forward).
+
+    Args:
+        equirect_depth: 2D float32 numpy array (H, W) storing metric radial distance.
+        face: Face name in ('front', 'right', 'back', 'left', 'up', 'down').
+        face_size: Width and height of square perspective face.
+        fov_deg: Field of view in degrees (default 90.0).
+
+    Returns:
+        (face_size, face_size) float32 numpy array representing camera-frame Z depth (depth_z).
+    """
+    height, width = equirect_depth.shape[:2]
+    half = face_size / 2.0
+    tan_half_fov = float(np.tan(np.deg2rad(fov_deg) / 2.0))
+    cols = ((np.arange(face_size, dtype=np.float64) + 0.5 - half) / half) * tan_half_fov
+    rows = ((np.arange(face_size, dtype=np.float64) + 0.5 - half) / half) * tan_half_fov
+    grid_x, grid_y = np.meshgrid(cols, rows)
+
+    # Cosine projection factor: rho = sqrt(1 + x^2 + y^2) converts radial distance r to planar depth_z = r / rho
+    rho = np.sqrt(1.0 + grid_x * grid_x + grid_y * grid_y).astype(np.float32)
+
+    rays = np.stack([grid_x, grid_y, np.ones_like(grid_x)], axis=-1)
+    pano = rays @ LOCAL_ROTATIONS[face].T
+    x = pano[..., 0]
+    y = pano[..., 1]
+    z = pano[..., 2]
+    lon = np.arctan2(x, z)
+    lat_up = np.arctan2(-y, np.hypot(x, z))
+    map_x = np.mod((lon / (2.0 * np.pi) + 0.5) * width, width)
+    map_y = np.clip((0.5 - lat_up / np.pi) * height, 0.0, height - 1.0)
+
+    # Pure float32 bilinear interpolation (preserves metric precision, avoids uint8 truncation)
+    x0 = np.floor(map_x).astype(np.int32)
+    y0 = np.floor(map_y).astype(np.int32)
+    wx = (map_x - x0).astype(np.float32)
+    wy = (map_y - y0).astype(np.float32)
+    x0 = np.mod(x0, width)
+    x1 = np.mod(x0 + 1, width)
+    y0 = np.clip(y0, 0, height - 1)
+    y1 = np.clip(y0 + 1, 0, height - 1)
+
+    eq = equirect_depth.astype(np.float32)
+    top = eq[y0, x0] * (1.0 - wx) + eq[y0, x1] * wx
+    bot = eq[y1, x0] * (1.0 - wx) + eq[y1, x1] * wx
+    radial_depth = top * (1.0 - wy) + bot * wy
+
+    # Convert radial distance to camera planar Z depth: depth_z = r / rho
+    face_depth_z = radial_depth / rho
+    # Clean non-finite or negative depths
+    face_depth_z = np.nan_to_num(face_depth_z, nan=0.0, posinf=0.0, neginf=0.0)
+    face_depth_z = np.maximum(face_depth_z, 0.0).astype(np.float32)
+    return face_depth_z
+
+
+def load_depth_scales(scale_file: Optional[Union[str, Path]]) -> Dict[str, dict]:
+    """Load MoGe depth scales JSON dictionary."""
+    if not scale_file:
+        return {}
+    sf = Path(scale_file)
+    if not sf.is_file():
+        return {}
+    try:
+        with open(sf, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"Warning: Failed to load depth scales from {sf}: {e}")
+        return {}
+
+
+def discover_depth_maps(
+    images_by_jobid: Dict[str, Path],
+    depth_dir: Optional[Union[str, Path]] = None,
+) -> Dict[str, Path]:
+    """
+    Discover matching .npy depth files for each jobId.
+    Searches depth_dir if provided, or adjacent to images.
+    """
+    depth_by_jobid: Dict[str, Path] = {}
+    search_dirs: List[Path] = []
+    if depth_dir:
+        dp = Path(depth_dir)
+        if dp.is_dir():
+            search_dirs.append(dp)
+    for img_path in images_by_jobid.values():
+        if img_path.parent not in search_dirs:
+            search_dirs.append(img_path.parent)
+
+    for job_id in images_by_jobid.keys():
+        for sdir in search_dirs:
+            candidates = [
+                sdir / f"{job_id}.npy",
+                sdir / f"{job_id}_depth.npy",
+            ]
+            found = False
+            for cand in candidates:
+                if cand.is_file():
+                    depth_by_jobid[job_id] = cand
+                    found = True
+                    break
+            if found:
+                break
+            for f in sdir.glob("*.npy"):
+                if job_id in f.stem:
+                    depth_by_jobid[job_id] = f
+                    found = True
+                    break
+            if found:
+                break
+
+    return depth_by_jobid
+
+
 def generate_camera_markers(
     poses: List[np.ndarray],
     radius: float = 0.25,
@@ -446,6 +567,10 @@ def reconstruct_panorama_dataset(
     input_path: Union[str, Path],
     metadata_path: Optional[Union[str, Path]] = None,
     output_path: Union[str, Path] = "output/reconstruction_v3",
+    depth_dir: Optional[Union[str, Path]] = None,
+    depth_scale_file: Optional[Union[str, Path]] = None,
+    depth_scale_metric: str = "median",
+    disable_depth: bool = False,
     face_size: int = 1024,
     fov_deg: float = 90.0,
     voxel_size: Optional[float] = 0.01,
@@ -482,6 +607,32 @@ def reconstruct_panorama_dataset(
     if verbose:
         print(f"\n[Metadata] Source: {metadata_file}")
         print(f"[Metadata] Found {len(raw_records)} records, matched {len(images_by_jobid)} panorama images.")
+
+    # Discover depth maps & scale factors
+    depth_scales: Dict[str, dict] = {}
+    depth_by_jobid: Dict[str, Path] = {}
+    if not disable_depth:
+        # If depth_scale_file not explicitly provided, search in depth_dir or adjacent to images
+        if not depth_scale_file:
+            search_dirs = [Path(depth_dir)] if depth_dir and Path(depth_dir).is_dir() else []
+            for p in images_by_jobid.values():
+                if p.parent not in search_dirs:
+                    search_dirs.append(p.parent)
+            for sdir in search_dirs:
+                scale_cand = sdir / "moge_depth_scales.json"
+                if scale_cand.is_file():
+                    depth_scale_file = scale_cand
+                    break
+
+        depth_scales = load_depth_scales(depth_scale_file)
+        depth_by_jobid = discover_depth_maps(images_by_jobid, depth_dir=depth_dir)
+        if verbose:
+            if depth_by_jobid:
+                print(f"[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps.")
+                if depth_scale_file:
+                    print(f"[Depth Prior] Using scales from: {depth_scale_file} (metric: '{depth_scale_metric}')")
+            else:
+                print(f"[Depth Prior] No depth maps found. Proceeding with images-only estimation.")
 
     # Heading convention verification
     if verbose:
@@ -582,9 +733,31 @@ def reconstruct_panorama_dataset(
                 with Image.open(st["image_path"]) as img:
                     equirect = np.asarray(img.convert("RGB"))
                 size = face_size if face_size > 0 else equirect.shape[1] // 4
+
+                # Check if equirect depth is available
+                st_depth_path = depth_by_jobid.get(job_id)
+                eq_depth = None
+                if st_depth_path and st_depth_path.is_file():
+                    try:
+                        raw_d = np.load(st_depth_path).astype(np.float32)
+                        if raw_d.ndim == 3 and raw_d.shape[-1] == 1:
+                            raw_d = raw_d.squeeze(-1)
+                        s_info = depth_scales.get(job_id)
+                        d_scale = 1.0
+                        if isinstance(s_info, dict):
+                            d_scale = float(s_info.get(depth_scale_metric, 1.0))
+                        elif isinstance(s_info, (int, float)):
+                            d_scale = float(s_info)
+                        eq_depth = raw_d * d_scale
+                    except Exception as e:
+                        print(f"Warning loading dry-run depth {st_depth_path}: {e}")
+
                 for face_name in FACE_ORDER:
                     sampled = sample_face(equirect, face_name, size, fov_deg=fov_deg)
                     Image.fromarray(sampled, mode="RGB").save(st_faces_dir / f"{face_name}.jpg", quality=95)
+                    if eq_depth is not None:
+                        f_depth_z = sample_face_depth(eq_depth, face_name, size, fov_deg=fov_deg)
+                        np.save(st_faces_dir / f"{face_name}_depth.npy", f_depth_z)
 
         if verbose:
             print(f"[Dry-Run Complete] Saved camera trajectory point cloud to: {final_ply_file}")
@@ -664,6 +837,26 @@ def reconstruct_panorama_dataset(
         if K_matrix is None or K_matrix.shape[0] != curr_face_size:
             K_matrix = get_intrinsics_matrix(curr_face_size, fov_deg=fov_deg)
 
+        # Load and scale equirectangular depth prior if available
+        equirect_depth = None
+        station_depth_path = depth_by_jobid.get(job_id)
+        if station_depth_path and station_depth_path.is_file():
+            try:
+                raw_depth = np.load(station_depth_path).astype(np.float32)
+                if raw_depth.ndim == 3 and raw_depth.shape[-1] == 1:
+                    raw_depth = raw_depth.squeeze(-1)
+                scale_info = depth_scales.get(job_id)
+                depth_scale_val = 1.0
+                if isinstance(scale_info, dict):
+                    depth_scale_val = float(scale_info.get(depth_scale_metric, 1.0))
+                elif isinstance(scale_info, (int, float)):
+                    depth_scale_val = float(scale_info)
+                equirect_depth = raw_depth * depth_scale_val
+                if verbose:
+                    print(f"  Loaded depth prior: {station_depth_path.name} (scale: {depth_scale_val:.4f}, range: [{np.nanmin(equirect_depth):.2f}, {np.nanmax(equirect_depth):.2f}] m)")
+            except Exception as e:
+                print(f"  Warning: Failed to load depth from {station_depth_path}: {e}")
+
         # Slice 6 perspective faces using extract_cubemap_faces sampling
         face_items = []
         station_faces_dir = faces_cache_dir / job_id if faces_cache_dir else None
@@ -676,6 +869,13 @@ def reconstruct_panorama_dataset(
             if station_faces_dir:
                 Image.fromarray(sampled_face, mode="RGB").save(station_faces_dir / f"{face_name}.jpg", quality=95)
 
+            # Sliced face depth (curr_face_size, curr_face_size) in camera Z frame
+            face_depth_z = None
+            if equirect_depth is not None:
+                face_depth_z = sample_face_depth(equirect_depth, face_name, curr_face_size, fov_deg=fov_deg)
+                if station_faces_dir:
+                    np.save(station_faces_dir / f"{face_name}_depth.npy", face_depth_z)
+
             # Face camera-to-world pose in OpenCV RDF
             R_face = face_pose(pos, heading, face_name)
             T_face = np.eye(4, dtype=np.float32)
@@ -685,6 +885,7 @@ def reconstruct_panorama_dataset(
             face_items.append({
                 "face_name": face_name,
                 "image": sampled_face,
+                "depth_z": face_depth_z,
                 "c2w": T_face,
             })
 
@@ -696,10 +897,14 @@ def reconstruct_panorama_dataset(
                 "intrinsics": torch.from_numpy(K_matrix),
                 "is_metric_scale": torch.tensor([True]),
             }
+            if face_item["depth_z"] is not None:
+                # Must be 2D (H, W) float32 for preprocess_inputs
+                view_dict["depth_z"] = torch.from_numpy(face_item["depth_z"])
             if use_pose_inputs:
                 view_dict["camera_poses"] = torch.from_numpy(face_item["c2w"])
             pano_raw_views.append(view_dict)
 
+        has_depth_input = any("depth_z" in v for v in pano_raw_views)
         pano_proc_views = preprocess_inputs(pano_raw_views, verbose=False)
 
         # Run inference
@@ -716,7 +921,7 @@ def reconstruct_panorama_dataset(
                 apply_confidence_mask=apply_confidence_mask,
                 confidence_percentile=confidence_percentile,
                 ignore_calibration_inputs=False,
-                ignore_depth_inputs=True,
+                ignore_depth_inputs=not has_depth_input,
                 ignore_pose_inputs=not use_pose_inputs,
                 ignore_pose_scale_inputs=False,
             )
@@ -928,6 +1133,31 @@ def main():
         default=False,
         help="Export sliced perspective cubemap face images to output directory.",
     )
+    parser.add_argument(
+        "--depth_dir",
+        type=str,
+        default=None,
+        help="Optional directory containing per-panorama .npy depth files (defaults to searching input images directory).",
+    )
+    parser.add_argument(
+        "--depth_scale_file",
+        type=str,
+        default=None,
+        help="Optional JSON file containing per-panorama depth scale factors (e.g. moge_depth_scales.json).",
+    )
+    parser.add_argument(
+        "--depth_scale_metric",
+        type=str,
+        default="median",
+        choices=["median", "mean"],
+        help="Scale metric from depth scale JSON to use for metric depth conversion (default: 'median').",
+    )
+    parser.add_argument(
+        "--disable_depth",
+        action="store_true",
+        default=False,
+        help="Disable input depth conditioning even if depth files are present.",
+    )
 
     args = parser.parse_args()
     model_name = "facebook/map-anything-apache" if args.apache else "facebook/map-anything"
@@ -941,6 +1171,10 @@ def main():
         input_path=input_path,
         metadata_path=metadata_path,
         output_path=final_file,
+        depth_dir=args.depth_dir,
+        depth_scale_file=args.depth_scale_file,
+        depth_scale_metric=args.depth_scale_metric,
+        disable_depth=args.disable_depth,
         face_size=args.face_size,
         fov_deg=args.fov,
         voxel_size=args.voxel_size,
