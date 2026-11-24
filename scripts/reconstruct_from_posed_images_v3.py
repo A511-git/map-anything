@@ -313,6 +313,84 @@ def sample_face_depth(
     return face_depth_z.astype(np.float32)
 
 
+def unproject_equirectangular_depth(
+    equirect_rgb: np.ndarray,
+    equirect_depth: np.ndarray,
+    c2w_front_rdf: np.ndarray,
+    min_depth: float = 0.05,
+    max_depth: float = 50.0,
+    stride: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Directly unproject a full 360° equirectangular depth map into world 3D coordinates.
+
+    Args:
+        equirect_rgb: (H, W, 3) uint8 or float32 image array.
+        equirect_depth: (H, W) float32 metric radial distance array.
+        c2w_front_rdf: (4, 4) camera-to-world transform in OpenCV RDF (+Z forward, +X right, +Y down).
+        min_depth: Minimum valid depth in meters.
+        max_depth: Maximum valid depth in meters.
+        stride: Subsampling stride (1 = full resolution, 2 = half resolution).
+
+    Returns:
+        (pts_world, colors_rgb): (N, 3) float32 points, (N, 3) uint8 colors.
+    """
+    H, W = equirect_depth.shape[:2]
+
+    # Optional subsampling stride
+    if stride > 1:
+        equirect_depth = equirect_depth[::stride, ::stride]
+        equirect_rgb = equirect_rgb[::stride, ::stride]
+        H, W = equirect_depth.shape[:2]
+
+    # Spherical longitude (yaw) and latitude (pitch)
+    u = np.arange(W, dtype=np.float32)
+    v = np.arange(H, dtype=np.float32)
+    u_grid, v_grid = np.meshgrid(u, v)
+
+    lon = ((u_grid + 0.5) / W - 0.5) * (2.0 * np.pi)
+    lat = (0.5 - (v_grid + 0.5) / H) * np.pi
+
+    cos_lat = np.cos(lat)
+    sin_lat = np.sin(lat)
+    sin_lon = np.sin(lon)
+    cos_lon = np.cos(lon)
+
+    # Unit ray direction in camera OpenCV RDF:
+    # +X right, +Y down, +Z forward
+    dx = cos_lat * sin_lon
+    dy = -sin_lat
+    dz = cos_lat * cos_lon
+
+    r = equirect_depth.astype(np.float32)
+    valid = np.isfinite(r) & (r >= min_depth) & (r <= max_depth)
+
+    if not np.any(valid):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    r_val = r[valid]
+    pts_cam = np.stack([
+        r_val * dx[valid],
+        r_val * dy[valid],
+        r_val * dz[valid],
+    ], axis=-1)  # (N, 3)
+
+    # Transform camera-space points to world-space
+    R = c2w_front_rdf[:3, :3].astype(np.float32)
+    t = c2w_front_rdf[:3, 3].astype(np.float32)
+    pts_world = pts_cam @ R.T + t
+
+    # Extract matching RGB colors
+    if equirect_rgb.ndim == 3 and equirect_rgb.shape[-1] >= 3:
+        colors = equirect_rgb[..., :3][valid]
+        if colors.dtype != np.uint8:
+            colors = np.clip(colors * 255.0 if colors.max() <= 1.0 else colors, 0, 255).astype(np.uint8)
+    else:
+        colors = np.full((len(pts_world), 3), 200, dtype=np.uint8)
+
+    return pts_world.astype(np.float32), colors.astype(np.uint8)
+
+
 def normalize_fs_path(p: Optional[Union[str, Path]]) -> Optional[Path]:
     """Normalize path strings across OS platforms, resolving mixed slashes."""
     if not p:
@@ -609,10 +687,11 @@ def reconstruct_panorama_dataset(
     depth_dir: Optional[Union[str, Path]] = None,
     depth_scale_file: Optional[Union[str, Path]] = None,
     depth_scale_metric: str = "median",
-    depth_mode: str = "scale_align",
+    depth_mode: str = "direct",
     disable_depth: bool = False,
     face_size: int = 1024,
     fov_deg: float = 90.0,
+    stride: int = 1,
     voxel_size: Optional[float] = 0.01,
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
@@ -811,7 +890,111 @@ def reconstruct_panorama_dataset(
             print(f"[Dry-Run Complete] Saved camera trajectory point cloud to: {final_ply_file}")
         return m_pts, m_colors, station_poses
 
-    # 2. Load MapAnything Model
+    # 2. Direct Full 360° Depth Mode (Bypasses neural inference and cubemap face slicing)
+    if depth_mode == "direct" and not disable_depth:
+        total_stations = len(station_records)
+        if verbose:
+            print(f"\n[Direct Depth] Running direct 360° equirectangular depth unprojection for {total_stations} stations...")
+            print(f"               (No neural model loading, no cubemap face slicing, zero perspective distortion)")
+
+        all_points = []
+        all_colors = []
+
+        for s_idx, st in enumerate(station_records):
+            job_id = st["jobId"]
+            img_path = st["image_path"]
+            pos = st["position"]
+            heading = st["heading"]
+            T_pano = station_poses[s_idx]
+
+            if verbose:
+                print(f"\n--- Station {s_idx + 1}/{total_stations}: '{job_id}' ---")
+                print(f"  Anchor World Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m, Heading: {heading:.2f}°")
+
+            with Image.open(img_path) as img:
+                equirect_rgb = np.asarray(img.convert("RGB"))
+
+            station_depth_path = depth_by_jobid.get(job_id)
+            if not station_depth_path or not station_depth_path.is_file():
+                if verbose:
+                    print(f"  [WARNING] No depth file found for '{job_id}', skipping station in direct depth mode.")
+                continue
+
+            try:
+                raw_depth = np.load(station_depth_path).astype(np.float32)
+                if raw_depth.ndim == 3 and raw_depth.shape[-1] == 1:
+                    raw_depth = raw_depth.squeeze(-1)
+
+                scale_info = depth_scales.get(job_id)
+                depth_scale_val = 1.0
+                if scale_info is not None:
+                    if isinstance(scale_info, dict):
+                        depth_scale_val = float(scale_info.get(depth_scale_metric, 1.0))
+                    elif isinstance(scale_info, (int, float)):
+                        depth_scale_val = float(scale_info)
+                else:
+                    if verbose:
+                        print(f"  [WARNING] Station '{job_id}' not found in depth_scales! Using fallback scale 1.0.")
+
+                equirect_depth = raw_depth * depth_scale_val
+                if verbose:
+                    raw_min, raw_max, raw_med = float(np.nanmin(raw_depth)), float(np.nanmax(raw_depth)), float(np.nanmedian(raw_depth))
+                    scaled_min, scaled_max, scaled_med = float(np.nanmin(equirect_depth)), float(np.nanmax(equirect_depth)), float(np.nanmedian(equirect_depth))
+                    print(f"  [Depth Prior] Station '{job_id}': loaded '{station_depth_path.name}'")
+                    print(f"    - Raw depth:    range=[{raw_min:.2f}, {raw_max:.2f}] m, median={raw_med:.2f} m")
+                    print(f"    - Applied scale factor ({depth_scale_metric}): {depth_scale_val:.4f}")
+                    print(f"    - Scaled depth: range=[{scaled_min:.2f}, {scaled_max:.2f}] m, median={scaled_med:.2f} m")
+
+                pts_world, colors_rgb = unproject_equirectangular_depth(
+                    equirect_rgb=equirect_rgb,
+                    equirect_depth=equirect_depth,
+                    c2w_front_rdf=T_pano,
+                    min_depth=0.05,
+                    max_depth=max_depth if max_depth and max_depth > 0 else 50.0,
+                    stride=stride,
+                )
+                if len(pts_world) > 0:
+                    all_points.append(pts_world)
+                    all_colors.append(colors_rgb)
+                    if verbose:
+                        print(f"  -> Generated {len(pts_world):,} 3D points directly from full 360° equirectangular depth.")
+            except Exception as e:
+                print(f"  [Error] Failed to unproject direct depth for '{job_id}': {e}")
+
+        # Combine, add camera markers, downsample, and save
+        if len(all_points) == 0:
+            print("[Warning] No 3D points were generated from direct depth unprojection.")
+            pts_combined = np.empty((0, 3), dtype=np.float32)
+            rgb_combined = np.empty((0, 3), dtype=np.uint8)
+        else:
+            pts_combined = np.concatenate(all_points, axis=0)
+            rgb_combined = np.concatenate(all_colors, axis=0)
+
+        if add_camera_markers:
+            marker_pts, marker_colors = generate_camera_markers(
+                station_poses,
+                radius=marker_radius,
+                marker_style=marker_style,
+            )
+            if verbose:
+                print(f"[Markers] Added {len(marker_pts):,} camera trajectory marker points (style: '{marker_style}').")
+            pts_combined = np.concatenate([pts_combined, marker_pts], axis=0) if len(pts_combined) > 0 else marker_pts
+            rgb_combined = np.concatenate([rgb_combined, marker_colors], axis=0) if len(rgb_combined) > 0 else marker_colors
+
+        # Voxel downsampling
+        if voxel_size is not None and voxel_size > 0 and not dense and len(pts_combined) > 0:
+            if verbose:
+                print(f"[Post-Process] Voxel downsampling {len(pts_combined):,} points at {voxel_size * 100:.1f} cm grid...")
+            pts_combined, rgb_combined = voxel_downsample(pts_combined, rgb_combined, voxel_size)
+            if verbose:
+                print(f"[Post-Process] Downsampled to {len(pts_combined):,} points.")
+
+        # Save PLY
+        save_point_cloud_ply(final_ply_file, pts_combined, rgb_combined, verbose=verbose)
+
+        return pts_combined, rgb_combined, station_poses
+
+    # 3. Load MapAnything Model
     try:
         import torch
         from mapanything.models import MapAnything
@@ -1256,14 +1439,22 @@ def main():
     parser.add_argument(
         "--depth_mode",
         type=str,
-        default="scale_align",
-        choices=["scale_align", "condition"],
+        default="direct",
+        choices=["direct", "scale_align", "condition"],
         help=(
             "Method for utilizing depth priors: "
-            "'scale_align' (recommended): runs MapAnything image inference for artifact-free geometry "
+            "'direct' (recommended): directly unprojects full 360° equirectangular depth maps "
+            "into world coordinates, bypassing cubemap slicing and neural inference; "
+            "'scale_align': runs MapAnything image inference for artifact-free geometry "
             "and locks metric scale using the depth prior; "
             "'condition': directly injects depth_z into MapAnything cross-attention."
         ),
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Subsampling pixel stride for direct 360° depth unprojection (default: 1 for full resolution, 2 for 2x downsampled).",
     )
     parser.add_argument(
         "--disable_depth",
@@ -1291,6 +1482,7 @@ def main():
         disable_depth=args.disable_depth,
         face_size=args.face_size,
         fov_deg=args.fov,
+        stride=args.stride,
         voxel_size=args.voxel_size,
         dense=args.dense,
         max_depth=args.max_depth,
