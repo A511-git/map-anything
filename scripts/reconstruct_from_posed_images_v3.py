@@ -665,9 +665,17 @@ def reconstruct_panorama_dataset(
         depth_by_jobid = discover_depth_maps(images_by_jobid, depth_dir=depth_dir)
         if verbose:
             if depth_by_jobid:
-                print(f"[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps (mode: '{depth_mode}').")
+                print(f"\n[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps (mode: '{depth_mode}').")
                 if resolved_scale_file:
-                    print(f"[Depth Prior] Successfully loaded scales from: {resolved_scale_file} ({len(depth_scales)} stations, metric: '{depth_scale_metric}')")
+                    print(f"[Depth Scales] Successfully loaded scales from: {resolved_scale_file}")
+                    print(f"[Depth Scales] Listing per-station scale factors ({depth_scale_metric}):")
+                    for jid, sinfo in depth_scales.items():
+                        if isinstance(sinfo, dict):
+                            med_val = sinfo.get("median", "N/A")
+                            mean_val = sinfo.get("mean", "N/A")
+                            print(f"  - '{jid}': median={med_val}, mean={mean_val}")
+                        else:
+                            print(f"  - '{jid}': scale={sinfo}")
                 else:
                     print(f"[WARNING] Found {len(depth_by_jobid)} depth maps, but could NOT load 'moge_depth_scales.json'!")
                     print(f"          All stations will use fallback scale 1.0, which may cause severe scale distortion!")
@@ -897,7 +905,12 @@ def reconstruct_panorama_dataset(
                         print(f"  [WARNING] Station '{job_id}' not found in depth_scales! Using fallback scale 1.0.")
                 equirect_depth = raw_depth * depth_scale_val
                 if verbose:
-                    print(f"  [Depth Prior] {station_depth_path.name} | Scale: {depth_scale_val:.4f} ({depth_scale_metric}) | Range: [{np.nanmin(equirect_depth):.2f}, {np.nanmax(equirect_depth):.2f}] m")
+                    raw_min, raw_max, raw_med = float(np.nanmin(raw_depth)), float(np.nanmax(raw_depth)), float(np.nanmedian(raw_depth))
+                    scaled_min, scaled_max, scaled_med = float(np.nanmin(equirect_depth)), float(np.nanmax(equirect_depth)), float(np.nanmedian(equirect_depth))
+                    print(f"  [Depth Prior] Station '{job_id}': loaded '{station_depth_path.name}'")
+                    print(f"    - Raw depth:    range=[{raw_min:.2f}, {raw_max:.2f}] m, median={raw_med:.2f} m")
+                    print(f"    - Applied scale factor ({depth_scale_metric}): {depth_scale_val:.4f}")
+                    print(f"    - Scaled depth: range=[{scaled_min:.2f}, {scaled_max:.2f}] m, median={scaled_med:.2f} m")
             except Exception as e:
                 print(f"  Warning: Failed to load depth from {station_depth_path}: {e}")
 
@@ -927,6 +940,10 @@ def reconstruct_panorama_dataset(
                 )
                 if station_faces_dir:
                     np.save(station_faces_dir / f"{face_name}_depth.npy", face_depth_z)
+                if verbose and face_name in ("front", "back"):
+                    val_d = face_depth_z[face_depth_z > 0]
+                    if len(val_d) > 0:
+                        print(f"  [Face Depth] '{face_name}': planar Z in [{val_d.min():.2f}, {val_d.max():.2f}] m (median: {np.median(val_d):.2f} m)")
 
             # Face camera-to-world pose in OpenCV RDF
             R_face = face_pose(pos, heading, face_name)
@@ -957,6 +974,8 @@ def reconstruct_panorama_dataset(
             pano_raw_views.append(view_dict)
 
         has_depth_input = any("depth_z" in v for v in pano_raw_views)
+        if verbose and has_depth_input:
+            print(f"  [Depth Conditioning] Passing 6 face depth tensors into MapAnything cross-attention.")
         pano_proc_views = preprocess_inputs(pano_raw_views, verbose=False)
 
         # Run inference
@@ -999,7 +1018,15 @@ def reconstruct_panorama_dataset(
                     scale_ratio = float(torch.median(ratio).item())
                     # Guard against unreasonable ratios (allow 0.1x to 10.0x)
                     if 0.1 < scale_ratio < 10.0:
+                        old_med = float(torch.median(depth_z[valid_pred]).item())
                         depth_z = depth_z * scale_ratio
+                        new_med = float(torch.median(depth_z[valid_pred]).item())
+                        if verbose:
+                            prior_med = float(torch.median(prior_depth[valid_prior]).item())
+                            print(f"  [Scale Align] '{face_item['face_name']}': pred_median={old_med:.2f}m, prior_median={prior_med:.2f}m -> scale_ratio={scale_ratio:.4f} => aligned_median={new_med:.2f}m")
+                else:
+                    if verbose:
+                        print(f"  [Scale Align] '{face_item['face_name']}': overlap count ({overlap.sum()}) <= 100, skipping alignment.")
 
             if use_pose_inputs:
                 # Use analytical world pose directly
