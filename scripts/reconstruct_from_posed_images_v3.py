@@ -1009,6 +1009,14 @@ def reconstruct_panorama_dataset(
             # In scale_align mode, align MapAnything's predicted depth with the scaled depth prior
             if depth_mode == "scale_align" and face_item["depth_z"] is not None:
                 prior_depth = torch.from_numpy(face_item["depth_z"]).to(device=depth_z.device, dtype=depth_z.dtype)
+                # MapAnything preprocessor resizes inputs to multiples of patch size 14 (e.g. 512 -> 518)
+                if prior_depth.shape != depth_z.shape:
+                    prior_depth = torch.nn.functional.interpolate(
+                        prior_depth[None, None, ...],
+                        size=depth_z.shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0, 0]
                 max_d_cutoff = max_depth if max_depth and max_depth > 0 else 50.0
                 valid_prior = (prior_depth >= 0.1) & (prior_depth <= max_d_cutoff)
                 valid_pred = (depth_z >= 0.1) & mask
