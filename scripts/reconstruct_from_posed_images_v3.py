@@ -337,6 +337,12 @@ def unproject_equirectangular_depth(
     """
     H, W = equirect_depth.shape[:2]
 
+    # Resize RGB image to match depth map dimensions if they differ (e.g. 4096x8192 RGB vs 1024x2048 depth)
+    if equirect_rgb.shape[:2] != (H, W):
+        pil_img = Image.fromarray(equirect_rgb)
+        pil_img = pil_img.resize((W, H), Image.Resampling.BILINEAR)
+        equirect_rgb = np.asarray(pil_img)
+
     # Optional subsampling stride
     if stride > 1:
         equirect_depth = equirect_depth[::stride, ::stride]
@@ -970,27 +976,27 @@ def reconstruct_panorama_dataset(
             pts_combined = np.concatenate(all_points, axis=0)
             rgb_combined = np.concatenate(all_colors, axis=0)
 
+        camera_markers_tuple = None
         if add_camera_markers:
-            marker_pts, marker_colors = generate_camera_markers(
+            m_pts, m_colors = generate_camera_markers(
                 station_poses,
                 radius=marker_radius,
                 marker_style=marker_style,
             )
+            camera_markers_tuple = (m_pts, m_colors)
             if verbose:
-                print(f"[Markers] Added {len(marker_pts):,} camera trajectory marker points (style: '{marker_style}').")
-            pts_combined = np.concatenate([pts_combined, marker_pts], axis=0) if len(pts_combined) > 0 else marker_pts
-            rgb_combined = np.concatenate([rgb_combined, marker_colors], axis=0) if len(rgb_combined) > 0 else marker_colors
+                print(f"[Markers] Added {len(m_pts):,} camera trajectory marker points (style: '{marker_style}').")
 
-        # Voxel downsampling
-        if voxel_size is not None and voxel_size > 0 and not dense and len(pts_combined) > 0:
-            if verbose:
-                print(f"[Post-Process] Voxel downsampling {len(pts_combined):,} points at {voxel_size * 100:.1f} cm grid...")
-            pts_combined, rgb_combined = voxel_downsample(pts_combined, rgb_combined, voxel_size)
-            if verbose:
-                print(f"[Post-Process] Downsampled to {len(pts_combined):,} points.")
-
-        # Save PLY
-        save_point_cloud_ply(final_ply_file, pts_combined, rgb_combined, verbose=verbose)
+        # Export binary PLY with optional voxel downsampling
+        export_point_cloud(
+            output_path=str(final_ply_file),
+            points=pts_combined,
+            colors=rgb_combined,
+            voxel_size=voxel_size,
+            camera_markers=camera_markers_tuple,
+            dense=dense,
+            verbose=verbose,
+        )
 
         return pts_combined, rgb_combined, station_poses
 
