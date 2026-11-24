@@ -252,6 +252,8 @@ def sample_face_depth(
     face: str,
     face_size: int,
     fov_deg: float = 90.0,
+    min_depth: float = 0.05,
+    max_depth: float = 50.0,
 ) -> np.ndarray:
     """
     Bilinear sample of one cubemap perspective depth face from an equirectangular depth map,
@@ -262,6 +264,8 @@ def sample_face_depth(
         face: Face name in ('front', 'right', 'back', 'left', 'up', 'down').
         face_size: Width and height of square perspective face.
         fov_deg: Field of view in degrees (default 90.0).
+        min_depth: Minimum valid depth in meters.
+        max_depth: Maximum valid depth in meters.
 
     Returns:
         (face_size, face_size) float32 numpy array representing camera-frame Z depth (depth_z).
@@ -303,26 +307,60 @@ def sample_face_depth(
 
     # Convert radial distance to camera planar Z depth: depth_z = r / rho
     face_depth_z = radial_depth / rho
-    # Clean non-finite or negative depths
+    # Clean non-finite or negative depths and clamp to valid range
     face_depth_z = np.nan_to_num(face_depth_z, nan=0.0, posinf=0.0, neginf=0.0)
-    face_depth_z = np.maximum(face_depth_z, 0.0).astype(np.float32)
-    return face_depth_z
+    face_depth_z = np.where((face_depth_z >= min_depth) & (face_depth_z <= max_depth), face_depth_z, 0.0)
+    return face_depth_z.astype(np.float32)
 
 
-def load_depth_scales(scale_file: Optional[Union[str, Path]]) -> Dict[str, dict]:
-    """Load MoGe depth scales JSON dictionary."""
-    if not scale_file:
-        return {}
-    sf = Path(scale_file)
-    if not sf.is_file():
-        return {}
-    try:
-        with open(sf, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f"Warning: Failed to load depth scales from {sf}: {e}")
-        return {}
+def normalize_fs_path(p: Optional[Union[str, Path]]) -> Optional[Path]:
+    """Normalize path strings across OS platforms, resolving mixed slashes."""
+    if not p:
+        return None
+    s = str(p).strip().strip('"').strip("'")
+    if not s:
+        return None
+    # Fix accidental Windows backslashes in Linux/POSIX environments
+    if os.name != "nt" and "\\" in s:
+        s = s.replace("\\", "/")
+    return Path(s)
+
+
+def load_depth_scales(
+    scale_file: Optional[Union[str, Path]],
+    search_dirs: Optional[List[Path]] = None,
+) -> Tuple[Dict[str, Any], Optional[Path]]:
+    """
+    Robustly load MoGe depth scales JSON dictionary with automatic path normalization
+    and fallback search across search_dirs.
+
+    Returns:
+        Tuple of (scales_dict, resolved_scale_path)
+    """
+    candidate_paths: List[Path] = []
+    if scale_file:
+        raw_s = str(scale_file).strip().strip('"').strip("'")
+        candidate_paths.append(Path(raw_s))
+        candidate_paths.append(Path(raw_s.replace("\\", "/")))
+        candidate_paths.append(Path(raw_s.replace("/", "\\")))
+
+    if search_dirs:
+        for sdir in search_dirs:
+            if sdir and sdir.is_dir():
+                candidate_paths.append(sdir / "moge_depth_scales.json")
+                candidate_paths.append(sdir / "depth_scales.json")
+
+    for cand in candidate_paths:
+        try:
+            if cand.is_file():
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data, cand.resolve()
+        except Exception:
+            pass
+
+    return {}, None
 
 
 def discover_depth_maps(
@@ -335,10 +373,9 @@ def discover_depth_maps(
     """
     depth_by_jobid: Dict[str, Path] = {}
     search_dirs: List[Path] = []
-    if depth_dir:
-        dp = Path(depth_dir)
-        if dp.is_dir():
-            search_dirs.append(dp)
+    norm_dd = normalize_fs_path(depth_dir)
+    if norm_dd and norm_dd.is_dir():
+        search_dirs.append(norm_dd)
     for img_path in images_by_jobid.values():
         if img_path.parent not in search_dirs:
             search_dirs.append(img_path.parent)
@@ -348,6 +385,8 @@ def discover_depth_maps(
             candidates = [
                 sdir / f"{job_id}.npy",
                 sdir / f"{job_id}_depth.npy",
+                sdir / f"{job_id}_pred_depth.npy",
+                sdir / f"{job_id}_moge_depth.npy",
             ]
             found = False
             for cand in candidates:
@@ -570,6 +609,7 @@ def reconstruct_panorama_dataset(
     depth_dir: Optional[Union[str, Path]] = None,
     depth_scale_file: Optional[Union[str, Path]] = None,
     depth_scale_metric: str = "median",
+    depth_mode: str = "scale_align",
     disable_depth: bool = False,
     face_size: int = 1024,
     fov_deg: float = 90.0,
@@ -611,26 +651,26 @@ def reconstruct_panorama_dataset(
     # Discover depth maps & scale factors
     depth_scales: Dict[str, dict] = {}
     depth_by_jobid: Dict[str, Path] = {}
+    resolved_scale_file: Optional[Path] = None
     if not disable_depth:
-        # If depth_scale_file not explicitly provided, search in depth_dir or adjacent to images
-        if not depth_scale_file:
-            search_dirs = [Path(depth_dir)] if depth_dir and Path(depth_dir).is_dir() else []
-            for p in images_by_jobid.values():
-                if p.parent not in search_dirs:
-                    search_dirs.append(p.parent)
-            for sdir in search_dirs:
-                scale_cand = sdir / "moge_depth_scales.json"
-                if scale_cand.is_file():
-                    depth_scale_file = scale_cand
-                    break
+        search_dirs: List[Path] = []
+        norm_dd = normalize_fs_path(depth_dir)
+        if norm_dd and norm_dd.is_dir():
+            search_dirs.append(norm_dd)
+        for p in images_by_jobid.values():
+            if p.parent not in search_dirs:
+                search_dirs.append(p.parent)
 
-        depth_scales = load_depth_scales(depth_scale_file)
+        depth_scales, resolved_scale_file = load_depth_scales(depth_scale_file, search_dirs=search_dirs)
         depth_by_jobid = discover_depth_maps(images_by_jobid, depth_dir=depth_dir)
         if verbose:
             if depth_by_jobid:
-                print(f"[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps.")
-                if depth_scale_file:
-                    print(f"[Depth Prior] Using scales from: {depth_scale_file} (metric: '{depth_scale_metric}')")
+                print(f"[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps (mode: '{depth_mode}').")
+                if resolved_scale_file:
+                    print(f"[Depth Prior] Successfully loaded scales from: {resolved_scale_file} ({len(depth_scales)} stations, metric: '{depth_scale_metric}')")
+                else:
+                    print(f"[WARNING] Found {len(depth_by_jobid)} depth maps, but could NOT load 'moge_depth_scales.json'!")
+                    print(f"          All stations will use fallback scale 1.0, which may cause severe scale distortion!")
             else:
                 print(f"[Depth Prior] No depth maps found. Proceeding with images-only estimation.")
 
@@ -847,13 +887,17 @@ def reconstruct_panorama_dataset(
                     raw_depth = raw_depth.squeeze(-1)
                 scale_info = depth_scales.get(job_id)
                 depth_scale_val = 1.0
-                if isinstance(scale_info, dict):
-                    depth_scale_val = float(scale_info.get(depth_scale_metric, 1.0))
-                elif isinstance(scale_info, (int, float)):
-                    depth_scale_val = float(scale_info)
+                if scale_info is not None:
+                    if isinstance(scale_info, dict):
+                        depth_scale_val = float(scale_info.get(depth_scale_metric, 1.0))
+                    elif isinstance(scale_info, (int, float)):
+                        depth_scale_val = float(scale_info)
+                else:
+                    if verbose:
+                        print(f"  [WARNING] Station '{job_id}' not found in depth_scales! Using fallback scale 1.0.")
                 equirect_depth = raw_depth * depth_scale_val
                 if verbose:
-                    print(f"  Loaded depth prior: {station_depth_path.name} (scale: {depth_scale_val:.4f}, range: [{np.nanmin(equirect_depth):.2f}, {np.nanmax(equirect_depth):.2f}] m)")
+                    print(f"  [Depth Prior] {station_depth_path.name} | Scale: {depth_scale_val:.4f} ({depth_scale_metric}) | Range: [{np.nanmin(equirect_depth):.2f}, {np.nanmax(equirect_depth):.2f}] m")
             except Exception as e:
                 print(f"  Warning: Failed to load depth from {station_depth_path}: {e}")
 
@@ -872,7 +916,15 @@ def reconstruct_panorama_dataset(
             # Sliced face depth (curr_face_size, curr_face_size) in camera Z frame
             face_depth_z = None
             if equirect_depth is not None:
-                face_depth_z = sample_face_depth(equirect_depth, face_name, curr_face_size, fov_deg=fov_deg)
+                max_d_cutoff = max_depth if max_depth and max_depth > 0 else 50.0
+                face_depth_z = sample_face_depth(
+                    equirect_depth,
+                    face_name,
+                    curr_face_size,
+                    fov_deg=fov_deg,
+                    min_depth=0.05,
+                    max_depth=max_d_cutoff,
+                )
                 if station_faces_dir:
                     np.save(station_faces_dir / f"{face_name}_depth.npy", face_depth_z)
 
@@ -897,8 +949,8 @@ def reconstruct_panorama_dataset(
                 "intrinsics": torch.from_numpy(K_matrix),
                 "is_metric_scale": torch.tensor([True]),
             }
-            if face_item["depth_z"] is not None:
-                # Must be 2D (H, W) float32 for preprocess_inputs
+            # Only condition MapAnything's cross-attention when depth_mode is 'condition'
+            if depth_mode == "condition" and face_item["depth_z"] is not None:
                 view_dict["depth_z"] = torch.from_numpy(face_item["depth_z"])
             if use_pose_inputs:
                 view_dict["camera_poses"] = torch.from_numpy(face_item["c2w"])
@@ -934,6 +986,20 @@ def reconstruct_panorama_dataset(
             intrinsics_view = pred["intrinsics"][0]        # (3, 3)
             mask = pred["mask"][0].squeeze(-1).bool()
             img_no_norm = pred["img_no_norm"][0]
+
+            # In scale_align mode, align MapAnything's predicted depth with the scaled depth prior
+            if depth_mode == "scale_align" and face_item["depth_z"] is not None:
+                prior_depth = torch.from_numpy(face_item["depth_z"]).to(device=depth_z.device, dtype=depth_z.dtype)
+                max_d_cutoff = max_depth if max_depth and max_depth > 0 else 50.0
+                valid_prior = (prior_depth >= 0.1) & (prior_depth <= max_d_cutoff)
+                valid_pred = (depth_z >= 0.1) & mask
+                overlap = valid_prior & valid_pred
+                if overlap.sum() > 100:
+                    ratio = prior_depth[overlap] / depth_z[overlap]
+                    scale_ratio = float(torch.median(ratio).item())
+                    # Guard against unreasonable ratios (allow 0.1x to 10.0x)
+                    if 0.1 < scale_ratio < 10.0:
+                        depth_z = depth_z * scale_ratio
 
             if use_pose_inputs:
                 # Use analytical world pose directly
@@ -1153,6 +1219,18 @@ def main():
         help="Scale metric from depth scale JSON to use for metric depth conversion (default: 'median').",
     )
     parser.add_argument(
+        "--depth_mode",
+        type=str,
+        default="scale_align",
+        choices=["scale_align", "condition"],
+        help=(
+            "Method for utilizing depth priors: "
+            "'scale_align' (recommended): runs MapAnything image inference for artifact-free geometry "
+            "and locks metric scale using the depth prior; "
+            "'condition': directly injects depth_z into MapAnything cross-attention."
+        ),
+    )
+    parser.add_argument(
         "--disable_depth",
         action="store_true",
         default=False,
@@ -1174,6 +1252,7 @@ def main():
         depth_dir=args.depth_dir,
         depth_scale_file=args.depth_scale_file,
         depth_scale_metric=args.depth_scale_metric,
+        depth_mode=args.depth_mode,
         disable_depth=args.disable_depth,
         face_size=args.face_size,
         fov_deg=args.fov,
