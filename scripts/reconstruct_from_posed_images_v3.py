@@ -397,6 +397,64 @@ def unproject_equirectangular_depth(
     return pts_world.astype(np.float32), colors.astype(np.uint8)
 
 
+def unproject_pinhole_depth_face(
+    face_rgb: np.ndarray,
+    face_depth_z: np.ndarray,
+    K_matrix: np.ndarray,
+    c2w_face_rdf: np.ndarray,
+    min_depth: float = 0.05,
+    max_depth: float = 50.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Directly unproject one perspective cubemap face (RGB + planar Z depth) into world 3D space.
+
+    Args:
+        face_rgb: (H, W, 3) uint8 or float32 image array.
+        face_depth_z: (H, W) float32 planar Z depth in camera frame (+Z forward).
+        K_matrix: (3, 3) pinhole camera intrinsics.
+        c2w_face_rdf: (4, 4) camera-to-world transform in OpenCV RDF.
+        min_depth: Minimum valid depth in meters.
+        max_depth: Maximum valid depth in meters.
+
+    Returns:
+        (pts_world, colors_rgb): (N, 3) float32 points, (N, 3) uint8 colors.
+    """
+    H, W = face_depth_z.shape[:2]
+    fx = float(K_matrix[0, 0])
+    fy = float(K_matrix[1, 1])
+    cx = float(K_matrix[0, 2])
+    cy = float(K_matrix[1, 2])
+
+    u = np.arange(W, dtype=np.float32)
+    v = np.arange(H, dtype=np.float32)
+    u_grid, v_grid = np.meshgrid(u, v)
+
+    z = face_depth_z.astype(np.float32)
+    valid = np.isfinite(z) & (z >= min_depth) & (z <= max_depth)
+
+    if not np.any(valid):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    z_val = z[valid]
+    x_val = (u_grid[valid] + 0.5 - cx) * (z_val / fx)
+    y_val = (v_grid[valid] + 0.5 - cy) * (z_val / fy)
+
+    pts_cam = np.stack([x_val, y_val, z_val], axis=-1)  # (N, 3) in OpenCV RDF
+
+    R = c2w_face_rdf[:3, :3].astype(np.float32)
+    t = c2w_face_rdf[:3, 3].astype(np.float32)
+    pts_world = pts_cam @ R.T + t
+
+    if face_rgb.ndim == 3 and face_rgb.shape[-1] >= 3:
+        colors = face_rgb[..., :3][valid]
+        if colors.dtype != np.uint8:
+            colors = np.clip(colors * 255.0 if colors.max() <= 1.0 else colors, 0, 255).astype(np.uint8)
+    else:
+        colors = np.full((len(pts_world), 3), 200, dtype=np.uint8)
+
+    return pts_world.astype(np.float32), colors.astype(np.uint8)
+
+
 def normalize_fs_path(p: Optional[Union[str, Path]]) -> Optional[Path]:
     """Normalize path strings across OS platforms, resolving mixed slashes."""
     if not p:
@@ -1000,6 +1058,146 @@ def reconstruct_panorama_dataset(
 
         return pts_combined, rgb_combined, station_poses
 
+    # 2b. Plain Cubemap Face Mode (direct_faces / plain_faces)
+    if depth_mode in ("direct_faces", "plain_faces") and not disable_depth:
+        total_stations = len(station_records)
+        if verbose:
+            print(f"\n[Direct Faces] Running plain cubemap face unprojection for {total_stations} stations...")
+            print(f"               (Slices 6 perspective faces at {fov_deg}° FoV, bypasses neural model inference)")
+
+        faces_cache_dir = target_dir / "cubemap_faces" if save_cubemap_faces else None
+        if faces_cache_dir:
+            faces_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        all_points = []
+        all_colors = []
+        K_matrix = None
+
+        for s_idx, st in enumerate(station_records):
+            job_id = st["jobId"]
+            img_path = st["image_path"]
+            pos = st["position"]
+            heading = st["heading"]
+
+            if verbose:
+                print(f"\n--- Station {s_idx + 1}/{total_stations}: '{job_id}' ---")
+                print(f"  Anchor World Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m, Heading: {heading:.2f}°")
+
+            with Image.open(img_path) as img:
+                equirect = np.asarray(img.convert("RGB"))
+
+            curr_face_size = face_size if face_size > 0 else equirect.shape[1] // 4
+            if K_matrix is None or K_matrix.shape[0] != curr_face_size:
+                K_matrix = get_intrinsics_matrix(curr_face_size, fov_deg=fov_deg)
+
+            station_depth_path = depth_by_jobid.get(job_id)
+            if not station_depth_path or not station_depth_path.is_file():
+                if verbose:
+                    print(f"  [WARNING] No depth file found for '{job_id}', skipping station in direct_faces mode.")
+                continue
+
+            try:
+                raw_depth = np.load(station_depth_path).astype(np.float32)
+                if raw_depth.ndim == 3 and raw_depth.shape[-1] == 1:
+                    raw_depth = raw_depth.squeeze(-1)
+
+                scale_info = depth_scales.get(job_id)
+                depth_scale_val = 1.0
+                if scale_info is not None:
+                    if isinstance(scale_info, dict):
+                        depth_scale_val = float(scale_info.get(depth_scale_metric, 1.0))
+                    elif isinstance(scale_info, (int, float)):
+                        depth_scale_val = float(scale_info)
+                else:
+                    if verbose:
+                        print(f"  [WARNING] Station '{job_id}' not found in depth_scales! Using fallback scale 1.0.")
+
+                equirect_depth = raw_depth * depth_scale_val
+                if verbose:
+                    raw_min, raw_max, raw_med = float(np.nanmin(raw_depth)), float(np.nanmax(raw_depth)), float(np.nanmedian(raw_depth))
+                    scaled_min, scaled_max, scaled_med = float(np.nanmin(equirect_depth)), float(np.nanmax(equirect_depth)), float(np.nanmedian(equirect_depth))
+                    print(f"  [Depth Prior] Station '{job_id}': loaded '{station_depth_path.name}'")
+                    print(f"    - Raw depth:    range=[{raw_min:.2f}, {raw_max:.2f}] m, median={raw_med:.2f} m")
+                    print(f"    - Applied scale factor ({depth_scale_metric}): {depth_scale_val:.4f}")
+                    print(f"    - Scaled depth: range=[{scaled_min:.2f}, {scaled_max:.2f}] m, median={scaled_med:.2f} m")
+
+                st_faces_dir = faces_cache_dir / job_id if faces_cache_dir else None
+                if st_faces_dir:
+                    st_faces_dir.mkdir(parents=True, exist_ok=True)
+
+                station_pts_count = 0
+                max_d_cutoff = max_depth if max_depth and max_depth > 0 else 50.0
+
+                for face_name in FACE_ORDER:
+                    sampled_face = sample_face(equirect, face_name, curr_face_size, fov_deg=fov_deg)
+                    face_depth_z = sample_face_depth(
+                        equirect_depth,
+                        face_name,
+                        curr_face_size,
+                        fov_deg=fov_deg,
+                        min_depth=0.05,
+                        max_depth=max_d_cutoff,
+                    )
+                    if st_faces_dir:
+                        Image.fromarray(sampled_face, mode="RGB").save(st_faces_dir / f"{face_name}.jpg", quality=95)
+                        np.save(st_faces_dir / f"{face_name}_depth.npy", face_depth_z)
+
+                    R_face = face_pose(pos, heading, face_name)
+                    T_face = np.eye(4, dtype=np.float32)
+                    T_face[:3, :3] = R_face.astype(np.float32)
+                    T_face[:3, 3] = pos.astype(np.float32)
+
+                    f_pts, f_colors = unproject_pinhole_depth_face(
+                        face_rgb=sampled_face,
+                        face_depth_z=face_depth_z,
+                        K_matrix=K_matrix,
+                        c2w_face_rdf=T_face,
+                        min_depth=0.05,
+                        max_depth=max_d_cutoff,
+                    )
+                    if len(f_pts) > 0:
+                        all_points.append(f_pts)
+                        all_colors.append(f_colors)
+                        station_pts_count += len(f_pts)
+
+                if verbose:
+                    print(f"  -> Generated {station_pts_count:,} 3D points from 6 cubemap pinhole faces.")
+            except Exception as e:
+                print(f"  [Error] Failed to unproject direct faces for '{job_id}': {e}")
+
+        # Combine, add camera markers, downsample, and save
+        if len(all_points) == 0:
+            print("[Warning] No 3D points were generated from direct_faces unprojection.")
+            pts_combined = np.empty((0, 3), dtype=np.float32)
+            rgb_combined = np.empty((0, 3), dtype=np.uint8)
+        else:
+            pts_combined = np.concatenate(all_points, axis=0)
+            rgb_combined = np.concatenate(all_colors, axis=0)
+
+        camera_markers_tuple = None
+        if add_camera_markers:
+            m_pts, m_colors = generate_camera_markers(
+                station_poses,
+                radius=marker_radius,
+                marker_style=marker_style,
+            )
+            camera_markers_tuple = (m_pts, m_colors)
+            if verbose:
+                print(f"[Markers] Added {len(m_pts):,} camera trajectory marker points (style: '{marker_style}').")
+
+        # Export binary PLY with optional voxel downsampling
+        export_point_cloud(
+            output_path=str(final_ply_file),
+            points=pts_combined,
+            colors=rgb_combined,
+            voxel_size=voxel_size,
+            camera_markers=camera_markers_tuple,
+            dense=dense,
+            verbose=verbose,
+        )
+
+        return pts_combined, rgb_combined, station_poses
+
     # 3. Load MapAnything Model
     try:
         import torch
@@ -1446,13 +1644,12 @@ def main():
         "--depth_mode",
         type=str,
         default="direct",
-        choices=["direct", "scale_align", "condition"],
+        choices=["direct", "direct_faces", "plain_faces", "scale_align", "condition"],
         help=(
             "Method for utilizing depth priors: "
-            "'direct' (recommended): directly unprojects full 360° equirectangular depth maps "
-            "into world coordinates, bypassing cubemap slicing and neural inference; "
-            "'scale_align': runs MapAnything image inference for artifact-free geometry "
-            "and locks metric scale using the depth prior; "
+            "'direct' (recommended default): directly unprojects full 360° equirectangular depth maps into world coordinates; "
+            "'direct_faces' (or 'plain_faces'): slices 6 cubemap perspective faces and unprojects directly via analytical pinhole geometry, bypassing neural inference; "
+            "'scale_align': runs MapAnything image inference for artifact-free geometry and locks metric scale using the depth prior; "
             "'condition': directly injects depth_z into MapAnything cross-attention."
         ),
     )
