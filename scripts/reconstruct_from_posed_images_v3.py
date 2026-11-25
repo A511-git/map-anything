@@ -752,7 +752,6 @@ def reconstruct_panorama_dataset(
     depth_scale_file: Optional[Union[str, Path]] = None,
     depth_scale_metric: str = "median",
     depth_mode: str = "direct",
-    disable_depth: bool = False,
     face_size: int = 1024,
     fov_deg: float = 90.0,
     stride: int = 1,
@@ -792,38 +791,34 @@ def reconstruct_panorama_dataset(
         print(f"[Metadata] Found {len(raw_records)} records, matched {len(images_by_jobid)} panorama images.")
 
     # Discover depth maps & scale factors
-    depth_scales: Dict[str, dict] = {}
-    depth_by_jobid: Dict[str, Path] = {}
-    resolved_scale_file: Optional[Path] = None
-    if not disable_depth:
-        search_dirs: List[Path] = []
-        norm_dd = normalize_fs_path(depth_dir)
-        if norm_dd and norm_dd.is_dir():
-            search_dirs.append(norm_dd)
-        for p in images_by_jobid.values():
-            if p.parent not in search_dirs:
-                search_dirs.append(p.parent)
+    search_dirs: List[Path] = []
+    norm_dd = normalize_fs_path(depth_dir)
+    if norm_dd and norm_dd.is_dir():
+        search_dirs.append(norm_dd)
+    for p in images_by_jobid.values():
+        if p.parent not in search_dirs:
+            search_dirs.append(p.parent)
 
-        depth_scales, resolved_scale_file = load_depth_scales(depth_scale_file, search_dirs=search_dirs)
-        depth_by_jobid = discover_depth_maps(images_by_jobid, depth_dir=depth_dir)
-        if verbose:
-            if depth_by_jobid:
-                print(f"\n[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps (mode: '{depth_mode}').")
-                if resolved_scale_file:
-                    print(f"[Depth Scales] Successfully loaded scales from: {resolved_scale_file}")
-                    print(f"[Depth Scales] Listing per-station scale factors ({depth_scale_metric}):")
-                    for jid, sinfo in depth_scales.items():
-                        if isinstance(sinfo, dict):
-                            med_val = sinfo.get("median", "N/A")
-                            mean_val = sinfo.get("mean", "N/A")
-                            print(f"  - '{jid}': median={med_val}, mean={mean_val}")
-                        else:
-                            print(f"  - '{jid}': scale={sinfo}")
-                else:
-                    print(f"[WARNING] Found {len(depth_by_jobid)} depth maps, but could NOT load 'moge_depth_scales.json'!")
-                    print(f"          All stations will use fallback scale 1.0, which may cause severe scale distortion!")
+    depth_scales, resolved_scale_file = load_depth_scales(depth_scale_file, search_dirs=search_dirs)
+    depth_by_jobid = discover_depth_maps(images_by_jobid, depth_dir=depth_dir)
+    if verbose:
+        if depth_by_jobid:
+            print(f"\n[Depth Prior] Matched {len(depth_by_jobid)}/{len(images_by_jobid)} depth maps (mode: '{depth_mode}').")
+            if resolved_scale_file:
+                print(f"[Depth Scales] Successfully loaded scales from: {resolved_scale_file}")
+                print(f"[Depth Scales] Listing per-station scale factors ({depth_scale_metric}):")
+                for jid, sinfo in depth_scales.items():
+                    if isinstance(sinfo, dict):
+                        med_val = sinfo.get("median", "N/A")
+                        mean_val = sinfo.get("mean", "N/A")
+                        print(f"  - '{jid}': median={med_val}, mean={mean_val}")
+                    else:
+                        print(f"  - '{jid}': scale={sinfo}")
             else:
-                print(f"[Depth Prior] No depth maps found. Proceeding with images-only estimation.")
+                print(f"[WARNING] Found {len(depth_by_jobid)} depth maps, but could NOT load 'moge_depth_scales.json'!")
+                print(f"          All stations will use fallback scale 1.0, which may cause severe scale distortion!")
+        else:
+            print(f"[Depth Prior] No depth maps found. Proceeding with images-only estimation.")
 
     # Heading convention verification
     if verbose:
@@ -955,7 +950,7 @@ def reconstruct_panorama_dataset(
         return m_pts, m_colors, station_poses
 
     # 2. Direct Full 360° Depth Mode (Bypasses neural inference and cubemap face slicing)
-    if depth_mode == "direct" and not disable_depth:
+    if depth_mode == "direct":
         total_stations = len(station_records)
         if verbose:
             print(f"\n[Direct Depth] Running direct 360° equirectangular depth unprojection for {total_stations} stations...")
@@ -1058,8 +1053,8 @@ def reconstruct_panorama_dataset(
 
         return pts_combined, rgb_combined, station_poses
 
-    # 2b. Plain Cubemap Face Mode (direct_faces / plain_faces)
-    if depth_mode in ("direct_faces", "plain_faces") and not disable_depth:
+    # 2b. Direct Cubemap Face Mode (direct_faces)
+    if depth_mode == "direct_faces":
         total_stations = len(station_records)
         if verbose:
             print(f"\n[Direct Faces] Running plain cubemap face unprojection for {total_stations} stations...")
@@ -1644,11 +1639,11 @@ def main():
         "--depth_mode",
         type=str,
         default="direct",
-        choices=["direct", "direct_faces", "plain_faces", "scale_align", "condition"],
+        choices=["direct", "direct_faces", "scale_align", "condition"],
         help=(
             "Method for utilizing depth priors: "
             "'direct' (recommended default): directly unprojects full 360° equirectangular depth maps into world coordinates; "
-            "'direct_faces' (or 'plain_faces'): slices 6 cubemap perspective faces and unprojects directly via analytical pinhole geometry, bypassing neural inference; "
+            "'direct_faces': slices 6 cubemap perspective faces and unprojects directly via analytical pinhole geometry, bypassing neural inference; "
             "'scale_align': runs MapAnything image inference for artifact-free geometry and locks metric scale using the depth prior; "
             "'condition': directly injects depth_z into MapAnything cross-attention."
         ),
@@ -1658,12 +1653,6 @@ def main():
         type=int,
         default=1,
         help="Subsampling pixel stride for direct 360° depth unprojection (default: 1 for full resolution, 2 for 2x downsampled).",
-    )
-    parser.add_argument(
-        "--disable_depth",
-        action="store_true",
-        default=False,
-        help="Disable input depth conditioning even if depth files are present.",
     )
 
     args = parser.parse_args()
@@ -1682,7 +1671,6 @@ def main():
         depth_scale_file=args.depth_scale_file,
         depth_scale_metric=args.depth_scale_metric,
         depth_mode=args.depth_mode,
-        disable_depth=args.disable_depth,
         face_size=args.face_size,
         fov_deg=args.fov,
         stride=args.stride,
