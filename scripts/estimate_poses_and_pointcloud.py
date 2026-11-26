@@ -166,19 +166,21 @@ LDA_CONVENTION = {
 
 def _axis_comment_for_mode(source_mode: Optional[str] = None) -> str:
     """Build a leading // comment describing camera/world axes for exports."""
-    if source_mode in ("mapanything_auto", "mapanything_calibrate"):
+    if source_mode == "mapanything_auto":
         world = (
             "worldFrame=View0 (model reference; view0 pose ~ identity); "
             "cameraAxes=OpenCV RDF (+X right, +Y down, +Z forward)"
         )
     else:
+        # poses + calibrate (calibrate composed into GT world via T_gt_anchor @ T_pred)
         world = (
-            "worldFrame=ARKit world (+Y up); "
+            "worldFrame=GT/OpenCV-RDF world (meters); "
             "cameraAxes=OpenCV RDF (+X right, +Y down, +Z forward)"
         )
     return (
         f"{world}; poses=4x4 cam2world; units=meters; "
-        "matrixOrder=columnMajor (LDA JSON) / row-major nested lists (poses.json)"
+        "matrixOrder=columnMajor (*_poses_world_opencv_rdf.json) / "
+        "row-major nested lists (poses.json)"
     )
 
 
@@ -395,7 +397,7 @@ def write_lda_poses_json(
     axis_comment = _axis_comment_for_mode(source_mode)
 
     convention = dict(LDA_CONVENTION)
-    if source_mode in ("mapanything_auto", "mapanything_calibrate"):
+    if source_mode == "mapanything_auto":
         convention["frame"] = "view0World"
         convention["axes"] = (
             "world: MapAnything View-0 frame (view0 pose ~ identity, meters); "
@@ -405,6 +407,12 @@ def write_lda_poses_json(
             "cameraToWorld": "worldFromCamera — maps RDF camera coords → View-0 world",
             "worldToCamera": "cameraFromWorld — maps View-0 world coords → RDF camera",
         }
+    elif source_mode == "mapanything_calibrate":
+        convention["frame"] = "gtWorld"
+        convention["axes"] = (
+            "world: GT OpenCV-RDF world (calibrated T_gt_anchor @ T_pred, meters); "
+            "camera: OpenCV RDF (+X right, +Y down, +Z forward / look +Z)"
+        )
 
     frames = []
     for i, fname in enumerate(image_filenames):
@@ -581,6 +589,130 @@ def _resolve_scene_output(
     return ply_file, target_dir
 
 
+def _resolve_chunk_size(
+    num_views: int,
+    chunk_size: Optional[int],
+    verbose: bool = True,
+) -> Optional[int]:
+    """
+    Resolve inference chunk size.
+
+    minibatch_size only helps the dense head; global attention still sees all
+    views in one forward. On ~15GB GPUs, 100+ views OOM — chunk the forward.
+    """
+    if chunk_size is not None:
+        return chunk_size if chunk_size > 0 else None
+
+    torch = _ensure_torch()
+    if num_views <= 8 or not torch.cuda.is_available():
+        return None
+    try:
+        total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    except Exception:
+        return None
+
+    # Kaggle T4/P100 (~15GB): keep chunks small. Larger cards can take more.
+    if total_mem_gb <= 16.5:
+        auto = 8 if num_views > 24 else 12
+    elif total_mem_gb <= 24.5:
+        auto = 16
+    else:
+        return None
+
+    if auto >= num_views:
+        return None
+    if verbose:
+        print(
+            f"Auto-selected chunk_size={auto} "
+            f"(GPU ~{total_mem_gb:.1f} GB, {num_views} views) to avoid OOM. "
+            f"Override with --chunk_size."
+        )
+    return auto
+
+
+def _infer_views_chunked(
+    model: object,
+    processed_views: List[dict],
+    *,
+    chunk_size: Optional[int],
+    minibatch_size: int,
+    apply_confidence_mask: bool,
+    confidence_percentile: float,
+    use_multiview_confidence: bool,
+    ignore_calibration_inputs: bool,
+    ignore_pose_inputs: bool,
+    verbose: bool,
+) -> List[dict]:
+    """Run model.infer, optionally in view chunks (clears CUDA cache between)."""
+    torch = _ensure_torch()
+    n = len(processed_views)
+    effective = _resolve_chunk_size(n, chunk_size, verbose=verbose)
+
+    infer_kwargs = dict(
+        memory_efficient_inference=True,
+        minibatch_size=minibatch_size,
+        use_amp=True,
+        amp_dtype="bf16",
+        apply_mask=True,
+        mask_edges=True,
+        apply_confidence_mask=apply_confidence_mask,
+        confidence_percentile=confidence_percentile,
+        use_multiview_confidence=use_multiview_confidence,
+        ignore_calibration_inputs=ignore_calibration_inputs,
+        ignore_depth_inputs=True,
+        ignore_pose_inputs=ignore_pose_inputs,
+        ignore_pose_scale_inputs=False,
+    )
+
+    if effective is None or effective >= n:
+        if verbose:
+            print(f"Running inference on {n} views (single forward)...")
+        return model.infer(processed_views, **infer_kwargs)
+
+    outputs: List[dict] = []
+    num_chunks = (n + effective - 1) // effective
+    if verbose:
+        print(
+            f"Running chunked inference ({effective} views/chunk, "
+            f"{num_chunks} chunks, {n} views)..."
+        )
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * effective
+        end = min(start + effective, n)
+        if verbose:
+            print(
+                f"  Chunk {chunk_idx + 1}/{num_chunks}: "
+                f"views [{start}..{end - 1}] ({end - start} views)..."
+            )
+        chunk_out = model.infer(processed_views[start:end], **infer_kwargs)
+        outputs.extend(chunk_out)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return outputs
+
+
+def _compose_pred_poses_to_gt_world(
+    pred_poses: np.ndarray,
+    input_poses: np.ndarray,
+    chunk_size: Optional[int],
+) -> np.ndarray:
+    """
+    Map chunk-local / View-0 predicted cam2world into GT world.
+
+    For each chunk, predicted poses are in the frame of the chunk's first view.
+    T_world_i = T_gt_anchor @ T_pred_i  puts them into the GT/OpenCV world.
+    """
+    n = len(pred_poses)
+    effective = chunk_size if chunk_size is not None and chunk_size > 0 else n
+    out = np.zeros_like(pred_poses)
+    for start in range(0, n, effective):
+        end = min(start + effective, n)
+        anchor = input_poses[start].astype(np.float64)
+        for i in range(start, end):
+            out[i] = (anchor @ pred_poses[i].astype(np.float64)).astype(np.float32)
+    return out
+
+
 def run_scene_auto(
     scene_dir: Path,
     output: Union[str, Path],
@@ -687,6 +819,7 @@ def _run_scene_posed(
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
     minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     use_multiview_confidence: bool = False,
@@ -698,9 +831,9 @@ def _run_scene_posed(
     """
     Shared GT-conditioned inference for --mode poses|calibrate.
 
-    use_predicted_poses=False: unproject + save INPUT GT poses (ARKit world).
-    use_predicted_poses=True:  unproject + save model-refined predicted poses
-                               (View 0 world — soft calibration around GT baseline).
+    use_predicted_poses=False: unproject + save INPUT GT poses (GT world).
+    use_predicted_poses=True:  soft-calibrate; map predicted poses into GT world
+                               via each chunk's anchor GT (T_gt_anchor @ T_pred).
     """
     from PIL import Image
 
@@ -718,6 +851,8 @@ def _run_scene_posed(
     if no_intrinsics:
         input_intrinsics = None
 
+    effective_chunk = _resolve_chunk_size(num_views, chunk_size, verbose=verbose)
+
     if verbose:
         print(f"\n=== [{mode_label}] Scene '{scene_name}' ({num_views} images) ===")
         print(f"Using pose JSON: {pose_json}")
@@ -727,11 +862,11 @@ def _run_scene_posed(
         )
         if use_predicted_poses:
             print(
-                "Cloud/export cameras: model-calibrated predicted poses "
-                "(View 0 frame; GT used as latent baseline)"
+                "Cloud/export cameras: model-calibrated poses mapped into GT world "
+                "(T_gt_anchor @ T_pred per chunk)"
             )
         else:
-            print("Cloud/export cameras: INPUT GT poses (ARKit/OpenCV world)")
+            print("Cloud/export cameras: INPUT GT poses (OpenCV-RDF world)")
         print(f"Output directory: {target_dir}")
 
     raw_views = []
@@ -750,47 +885,56 @@ def _run_scene_posed(
         print("Preprocessing views (resize + optional K scaling)...")
     processed_views = preprocess_inputs(raw_views, verbose=False)
 
-    if verbose:
-        print(f"Running posed inference on {num_views} views...")
-    outputs = model.infer(
+    outputs = _infer_views_chunked(
+        model,
         processed_views,
-        memory_efficient_inference=True,
+        chunk_size=effective_chunk,
         minibatch_size=minibatch_size,
-        use_amp=True,
-        amp_dtype="bf16",
-        apply_mask=True,
-        mask_edges=True,
         apply_confidence_mask=apply_confidence_mask,
         confidence_percentile=confidence_percentile,
         use_multiview_confidence=use_multiview_confidence,
         ignore_calibration_inputs=input_intrinsics is None,
-        ignore_depth_inputs=True,
         ignore_pose_inputs=False,
-        ignore_pose_scale_inputs=False,
-    )
-
-    pred_poses, pred_intrinsics, points, colors = _assemble_point_cloud_from_outputs(
-        outputs,
-        image_filenames,
-        unproject_poses=None if use_predicted_poses else input_poses,
-        max_depth=max_depth,
         verbose=verbose,
     )
 
+    # Collect raw predicted cameras (chunk-local View-0 frame when chunked).
+    pred_poses_local = []
+    pred_intrinsics_list = []
+    for pred in outputs:
+        pred_poses_local.append(
+            pred["camera_poses"][0].detach().cpu().numpy().astype(np.float32)
+        )
+        pred_intrinsics_list.append(
+            pred["intrinsics"][0].detach().cpu().numpy().astype(np.float32)
+        )
+    pred_poses_local_arr = np.stack(pred_poses_local, axis=0)
+    pred_intrinsics = np.stack(pred_intrinsics_list, axis=0)
+
     if use_predicted_poses:
-        # Final used = model-refined cameras (View 0 world).
-        export_poses = pred_poses.astype(np.float32)
+        export_poses = _compose_pred_poses_to_gt_world(
+            pred_poses_local_arr, input_poses, effective_chunk
+        )
         export_intrinsics = pred_intrinsics.astype(np.float32)
+        unproject_poses = export_poses
         source_mode = "mapanything_calibrate"
     else:
-        # Final used = INPUT GT poses; K = input when present else predicted.
         export_poses = input_poses.astype(np.float32)
         export_intrinsics = (
             input_intrinsics.astype(np.float32)
             if input_intrinsics is not None
             else pred_intrinsics
         )
+        unproject_poses = input_poses
         source_mode = "mapanything_poses"
+
+    _, _, points, colors = _assemble_point_cloud_from_outputs(
+        outputs,
+        image_filenames,
+        unproject_poses=unproject_poses,
+        max_depth=max_depth,
+        verbose=verbose,
+    )
 
     if verbose:
         print(f"Total raw 3D points: {len(points):,}")
@@ -808,10 +952,11 @@ def _run_scene_posed(
             "gt_poses_json": str(pose_json),
             "used_input_intrinsics": input_intrinsics is not None,
             "used_predicted_poses": use_predicted_poses,
+            "chunk_size": effective_chunk,
         },
     )
     if verbose:
-        print(f"Saved final-used LDA poses JSON -> {lda_json_path}")
+        print(f"Saved final-used poses JSON -> {lda_json_path}")
 
     _save_npy_json_companions(
         target_dir,
@@ -848,6 +993,7 @@ def run_scene_poses(
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
     minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     use_multiview_confidence: bool = False,
@@ -867,6 +1013,7 @@ def run_scene_poses(
         poses_path=poses_path,
         no_intrinsics=no_intrinsics,
         minibatch_size=minibatch_size,
+        chunk_size=chunk_size,
         apply_confidence_mask=apply_confidence_mask,
         confidence_percentile=confidence_percentile,
         use_multiview_confidence=use_multiview_confidence,
@@ -885,6 +1032,7 @@ def run_scene_calibrate(
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
     minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     use_multiview_confidence: bool = False,
@@ -894,8 +1042,8 @@ def run_scene_calibrate(
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
     """
-    GT poses as latent baseline; unproject and save model-calibrated predicted
-    poses/intrinsics in View 0 frame (not raw ARKit world).
+    GT poses as latent baseline; export model-calibrated poses mapped into GT
+    world (T_gt_anchor @ T_pred). Supports chunked inference for low VRAM.
     """
     return _run_scene_posed(
         scene_dir=scene_dir,
@@ -907,6 +1055,7 @@ def run_scene_calibrate(
         poses_path=poses_path,
         no_intrinsics=no_intrinsics,
         minibatch_size=minibatch_size,
+        chunk_size=chunk_size,
         apply_confidence_mask=apply_confidence_mask,
         confidence_percentile=confidence_percentile,
         use_multiview_confidence=use_multiview_confidence,
@@ -927,6 +1076,7 @@ def estimate_poses_and_pointcloud(
     model_name: str = "facebook/map-anything",
     device: Optional[str] = None,
     minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     use_multiview_confidence: bool = False,
@@ -1004,6 +1154,7 @@ def estimate_poses_and_pointcloud(
                 poses_path=poses_override,
                 no_intrinsics=no_intrinsics,
                 minibatch_size=minibatch_size,
+                chunk_size=chunk_size,
                 apply_confidence_mask=apply_confidence_mask,
                 confidence_percentile=confidence_percentile,
                 use_multiview_confidence=use_multiview_confidence,
@@ -1090,6 +1241,16 @@ def main() -> None:
         help="Dense-head minibatch size for memory-efficient inference (default: 1)",
     )
     parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=None,
+        help=(
+            "Views per transformer forward (poses/calibrate). "
+            "Default: auto (8 on <=16GB GPUs when many views). "
+            "Use 4–8 on Kaggle T4 if OOM persists. 0 = disable chunking."
+        ),
+    )
+    parser.add_argument(
         "--apply_confidence_mask",
         action="store_true",
         help="Filter low-confidence regions in dense geometry",
@@ -1119,8 +1280,8 @@ def main() -> None:
     parser.add_argument(
         "--max_depth",
         type=float,
-        default=25.0,
-        help="Max depth in meters to keep (<= 0 disables; default: 25.0)",
+        default=50.0,
+        help="Max depth in meters to keep (<= 0 disables; default: 50.0)",
     )
 
     args = parser.parse_args()
@@ -1149,6 +1310,7 @@ def main() -> None:
         model_name=model_name,
         device=args.device,
         minibatch_size=args.minibatch_size,
+        chunk_size=args.chunk_size,
         apply_confidence_mask=args.apply_confidence_mask,
         confidence_percentile=args.confidence_percentile,
         use_multiview_confidence=args.use_multiview_confidence,
