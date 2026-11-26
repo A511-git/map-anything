@@ -11,7 +11,7 @@ Estimate / reconstruct with MapAnything in three modes:
   --mode poses      GT LDA poses as hard cameras: condition the model, unproject
                     and save with INPUT OpenCV-RDF poses (ARKit world).
   --mode calibrate  GT poses as baseline in latent space; unproject and save
-                    with model-refined predicted poses/K (View-0 world).
+                    with model-refined predicted poses mapped into GT world.
 
 Every mode writes the final used poses + intrinsics under --output
 (<scene>_poses_world_opencv_rdf.json, poses.npy, intrinsics.npy) plus pointcloud.ply.
@@ -24,6 +24,15 @@ Input may be a single scene folder or an LDA-style root with scene subfolders:
         9oPhlqgwrM_poses_world_opencv_rdf.json
       …
 
+--single_world (multi-scene root):
+  Joint inference over all faces from all scenes → one shared world export under
+  <output>/single_world/ (no per-scene folders, no jobdata).
+    auto       — one images-only pass; model poses all faces in one View-0 world
+    poses      — one GT-conditioned depth/cloud pass; cameras stay INPUT GT
+    calibrate  — one GT-baseline pass; export T_gt_anchor @ T_pred in arkitWorld
+
+Without --single_world each scene is processed separately (auto = separate worlds).
+
 Usage:
     python scripts/estimate_poses_and_pointcloud.py \\
         --mode auto \\
@@ -35,6 +44,7 @@ Usage:
         --mode poses \\
         --input path/to/LDA \\
         --output output/posed_reconstruction \\
+        --single_world \\
         --minibatch_size 1
 
     python scripts/estimate_poses_and_pointcloud.py \\
@@ -555,10 +565,16 @@ def write_lda_poses_json(
     for i, fname in enumerate(image_filenames):
         c2w = np.asarray(poses[i], dtype=np.float64).reshape(4, 4)
         w2c = np.linalg.inv(c2w)
+        # Prefixed ids (e.g. scene/0.jpg from --single_world) are kept as-is.
+        image_id = (
+            fname
+            if ("/" in fname or "\\" in fname)
+            else f"{scene_name}/{fname}"
+        )
         frames.append(
             {
                 "index": i,
-                "image": f"{scene_name}/{fname}",
+                "image": image_id,
                 "intrinsicsImage": _matrix_to_intrinsics_dict(intrinsics[i]),
                 "cameraToWorld": _mat4_to_column_major_list(c2w),
                 "worldToCamera": _mat4_to_column_major_list(w2c),
@@ -724,6 +740,104 @@ def _resolve_scene_output(
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     return ply_file, target_dir
+
+
+def _resolve_single_world_output(output: Union[str, Path]) -> Tuple[str, Path]:
+    """Artifacts for --single_world land in <output>/single_world/."""
+    return _resolve_scene_output(output, Path("single_world"))
+
+
+def collect_single_world_views(
+    scenes: List[Path],
+    *,
+    need_poses: bool,
+    no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Flatten all scene folders into one joint view list.
+
+    Image ids are '{scene_name}/{basename}'. For poses/calibrate, stacks
+    GT cameraToWorld (+ optional intrinsics) already in shared arkitWorld.
+    """
+    if not scenes:
+        raise ValueError("collect_single_world_views: no scenes provided")
+
+    all_paths: List[str] = []
+    all_names: List[str] = []
+    pose_parts: List[np.ndarray] = []
+    intrins_parts: List[np.ndarray] = []
+    scene_names: List[str] = []
+    pose_json_paths: List[str] = []
+    any_missing_intrinsics = False
+
+    for scene_dir in scenes:
+        scene_name = scene_dir.name
+        image_paths, image_filenames = find_images(scene_dir)
+
+        pose_json: Optional[Path] = None
+        if need_poses or no_secondary or no_primary:
+            pose_json = find_poses_json(scene_dir)
+            image_paths, image_filenames = apply_secondary_frame_filter(
+                image_paths,
+                image_filenames,
+                pose_json,
+                no_secondary=no_secondary,
+                no_primary=no_primary,
+                verbose=verbose,
+            )
+
+        if not image_paths:
+            raise ValueError(f"No images left in scene after filters: {scene_dir}")
+
+        prefixed = [f"{scene_name}/{fname}" for fname in image_filenames]
+        all_paths.extend(image_paths)
+        all_names.extend(prefixed)
+        scene_names.append(scene_name)
+
+        if need_poses:
+            assert pose_json is not None
+            poses_i, intrins_i = load_lda_poses_json(pose_json, image_filenames)
+            pose_parts.append(poses_i)
+            pose_json_paths.append(str(pose_json))
+            if no_intrinsics or intrins_i is None:
+                any_missing_intrinsics = True
+            else:
+                intrins_parts.append(intrins_i)
+
+        if verbose:
+            print(
+                f"  [single_world] {scene_name}: {len(image_filenames)} view(s)"
+                + (f" from {pose_json.name}" if pose_json is not None else "")
+            )
+
+    result: Dict[str, Any] = {
+        "image_paths": all_paths,
+        "image_filenames": all_names,
+        "scene_names": scene_names,
+        "pose_json_paths": pose_json_paths,
+        "input_poses": None,
+        "input_intrinsics": None,
+    }
+
+    if need_poses:
+        result["input_poses"] = np.concatenate(pose_parts, axis=0)
+        if not any_missing_intrinsics and len(intrins_parts) == len(pose_parts):
+            result["input_intrinsics"] = np.concatenate(intrins_parts, axis=0)
+        elif verbose and not no_intrinsics:
+            print(
+                "[single_world] Intrinsics incomplete across scenes; "
+                "model will predict K"
+            )
+
+    if verbose:
+        print(
+            f"[single_world] Combined {len(all_names)} view(s) from "
+            f"{len(scene_names)} scene(s)"
+        )
+    return result
 
 
 def _resolve_chunk_size(
@@ -1236,6 +1350,311 @@ def run_scene_calibrate(
     )
 
 
+def run_single_world_auto(
+    scenes: List[Path],
+    output: Union[str, Path],
+    model: object,
+    device: str,
+    *,
+    no_secondary: bool = False,
+    no_primary: bool = False,
+    minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
+    apply_confidence_mask: bool = False,
+    confidence_percentile: float = 10.0,
+    use_multiview_confidence: bool = False,
+    voxel_size: Optional[float] = 0.01,
+    dense: bool = False,
+    max_depth: Optional[float] = 25.0,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+    """
+    Joint images-only infer over all scenes → one View-0 world.
+
+    Chunking is refused: each chunk would be its own View-0 frame.
+    """
+    from mapanything.utils.image import load_images
+
+    if chunk_size is not None and chunk_size > 0:
+        raise ValueError(
+            "--single_world with --mode auto cannot use --chunk_size "
+            "(chunking would split into disconnected View-0 worlds). "
+            "Omit --chunk_size, or reduce views with --no_secondary / --no_primary."
+        )
+
+    bundle = collect_single_world_views(
+        scenes,
+        need_poses=False,
+        no_secondary=no_secondary,
+        no_primary=no_primary,
+        verbose=verbose,
+    )
+    image_paths: List[str] = bundle["image_paths"]
+    image_filenames: List[str] = bundle["image_filenames"]
+    num_views = len(image_paths)
+    ply_file, target_dir = _resolve_single_world_output(output)
+
+    if verbose:
+        print(f"\n=== [auto|single_world] {num_views} views / {len(scenes)} scene(s) ===")
+        print(f"Output directory: {target_dir}")
+        print("Running joint images-only inference (one View-0 world)...")
+
+    views = load_images(image_paths, verbose=False)
+    outputs = model.infer(
+        views,
+        memory_efficient_inference=True,
+        minibatch_size=minibatch_size,
+        use_amp=True,
+        amp_dtype="bf16",
+        apply_mask=True,
+        mask_edges=True,
+        apply_confidence_mask=apply_confidence_mask,
+        confidence_percentile=confidence_percentile,
+        use_multiview_confidence=use_multiview_confidence,
+    )
+
+    pred_poses, pred_intrinsics, points, colors = _assemble_point_cloud_from_outputs(
+        outputs,
+        image_filenames,
+        unproject_poses=None,
+        max_depth=max_depth,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print(f"Total raw 3D points: {len(points):,}")
+        print(f"View 0 pose (model world origin):\n{pred_poses[0]}")
+
+    lda_json_path = target_dir / "single_world_poses_world_opencv_rdf.json"
+    write_lda_poses_json(
+        lda_json_path,
+        scene_name="single_world",
+        image_filenames=image_filenames,
+        poses=pred_poses,
+        intrinsics=pred_intrinsics,
+        source_meta={
+            "mode": "mapanything_auto",
+            "singleWorld": True,
+            "scenes": bundle["scene_names"],
+        },
+    )
+    if verbose:
+        print(f"Saved predicted LDA poses JSON -> {lda_json_path}")
+
+    _save_npy_json_companions(
+        target_dir,
+        image_filenames,
+        pred_poses,
+        pred_intrinsics,
+        verbose=verbose,
+        source_mode="mapanything_auto",
+    )
+
+    export_point_cloud, _ = _v3_io()
+    export_point_cloud(
+        output_path=ply_file,
+        points=points,
+        colors=colors,
+        voxel_size=voxel_size,
+        dense=dense,
+        verbose=verbose,
+    )
+    if verbose:
+        print(f"Saved point cloud -> {ply_file}")
+
+    torch = _ensure_torch()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return pred_poses, pred_intrinsics, image_filenames, ply_file
+
+
+def run_single_world_posed(
+    scenes: List[Path],
+    output: Union[str, Path],
+    model: object,
+    device: str,
+    *,
+    mode_label: str,
+    use_predicted_poses: bool,
+    no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
+    minibatch_size: int = 1,
+    chunk_size: Optional[int] = None,
+    apply_confidence_mask: bool = False,
+    confidence_percentile: float = 10.0,
+    use_multiview_confidence: bool = False,
+    voxel_size: Optional[float] = 0.01,
+    dense: bool = False,
+    max_depth: Optional[float] = 25.0,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+    """
+    Joint GT-conditioned infer over all scenes in shared arkitWorld.
+
+    poses: unproject/export INPUT GT cameras.
+    calibrate: export T_gt_anchor @ T_pred into that same GT world.
+    """
+    from PIL import Image
+
+    from mapanything.utils.image import preprocess_inputs
+
+    torch = _ensure_torch()
+
+    bundle = collect_single_world_views(
+        scenes,
+        need_poses=True,
+        no_intrinsics=no_intrinsics,
+        no_secondary=no_secondary,
+        no_primary=no_primary,
+        verbose=verbose,
+    )
+    image_paths: List[str] = bundle["image_paths"]
+    image_filenames: List[str] = bundle["image_filenames"]
+    input_poses: np.ndarray = bundle["input_poses"]
+    input_intrinsics: Optional[np.ndarray] = bundle["input_intrinsics"]
+    if no_intrinsics:
+        input_intrinsics = None
+
+    num_views = len(image_paths)
+    ply_file, target_dir = _resolve_single_world_output(output)
+    effective_chunk = _resolve_chunk_size(num_views, chunk_size, verbose=verbose)
+
+    if verbose:
+        print(
+            f"\n=== [{mode_label}|single_world] "
+            f"{num_views} views / {len(scenes)} scene(s) ==="
+        )
+        print(
+            f"Intrinsics: "
+            f"{'from JSON' if input_intrinsics is not None else 'model-predicted'}"
+        )
+        if use_predicted_poses:
+            print(
+                "Cloud/export cameras: model-calibrated poses mapped into GT world "
+                "(T_gt_anchor @ T_pred per chunk)"
+            )
+        else:
+            print("Cloud/export cameras: INPUT GT poses (OpenCV-RDF / arkitWorld)")
+        print(f"Output directory: {target_dir}")
+
+    raw_views = []
+    for i, img_path in enumerate(image_paths):
+        img_arr = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+        view_dict: Dict[str, Any] = {
+            "img": torch.from_numpy(img_arr),
+            "camera_poses": torch.from_numpy(input_poses[i]),
+            "is_metric_scale": torch.tensor([True]),
+        }
+        if input_intrinsics is not None:
+            view_dict["intrinsics"] = torch.from_numpy(input_intrinsics[i])
+        raw_views.append(view_dict)
+
+    if verbose:
+        print("Preprocessing views (resize + optional K scaling)...")
+    processed_views = preprocess_inputs(raw_views, verbose=False)
+
+    outputs = _infer_views_chunked(
+        model,
+        processed_views,
+        chunk_size=effective_chunk,
+        minibatch_size=minibatch_size,
+        apply_confidence_mask=apply_confidence_mask,
+        confidence_percentile=confidence_percentile,
+        use_multiview_confidence=use_multiview_confidence,
+        ignore_calibration_inputs=input_intrinsics is None,
+        ignore_pose_inputs=False,
+        verbose=verbose,
+    )
+
+    pred_poses_local = []
+    pred_intrinsics_list = []
+    for pred in outputs:
+        pred_poses_local.append(
+            pred["camera_poses"][0].detach().cpu().numpy().astype(np.float32)
+        )
+        pred_intrinsics_list.append(
+            pred["intrinsics"][0].detach().cpu().numpy().astype(np.float32)
+        )
+    pred_poses_local_arr = np.stack(pred_poses_local, axis=0)
+    pred_intrinsics = np.stack(pred_intrinsics_list, axis=0)
+
+    if use_predicted_poses:
+        export_poses = _compose_pred_poses_to_gt_world(
+            pred_poses_local_arr, input_poses, effective_chunk
+        )
+        export_intrinsics = pred_intrinsics.astype(np.float32)
+        unproject_poses = export_poses
+        source_mode = "mapanything_calibrate"
+    else:
+        export_poses = input_poses.astype(np.float32)
+        export_intrinsics = (
+            input_intrinsics.astype(np.float32)
+            if input_intrinsics is not None
+            else pred_intrinsics
+        )
+        unproject_poses = input_poses
+        source_mode = "mapanything_poses"
+
+    _, _, points, colors = _assemble_point_cloud_from_outputs(
+        outputs,
+        image_filenames,
+        unproject_poses=unproject_poses,
+        max_depth=max_depth,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print(f"Total raw 3D points: {len(points):,}")
+
+    lda_json_path = target_dir / "single_world_poses_world_opencv_rdf.json"
+    write_lda_poses_json(
+        lda_json_path,
+        scene_name="single_world",
+        image_filenames=image_filenames,
+        poses=export_poses,
+        intrinsics=export_intrinsics,
+        source_meta={
+            "mode": source_mode,
+            "singleWorld": True,
+            "scenes": bundle["scene_names"],
+            "gt_poses_json": bundle["pose_json_paths"],
+            "used_input_intrinsics": input_intrinsics is not None,
+            "used_predicted_poses": use_predicted_poses,
+            "chunk_size": effective_chunk,
+        },
+    )
+    if verbose:
+        print(f"Saved final-used poses JSON -> {lda_json_path}")
+
+    _save_npy_json_companions(
+        target_dir,
+        image_filenames,
+        export_poses,
+        export_intrinsics,
+        verbose=verbose,
+        source_mode=source_mode,
+    )
+
+    export_point_cloud, _ = _v3_io()
+    export_point_cloud(
+        output_path=ply_file,
+        points=points,
+        colors=colors,
+        voxel_size=voxel_size,
+        dense=dense,
+        verbose=verbose,
+    )
+    if verbose:
+        print(f"Saved point cloud -> {ply_file}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return export_poses, export_intrinsics, image_filenames, ply_file
+
+
 def estimate_poses_and_pointcloud(
     images: Union[str, Path],
     output: Union[str, Path] = "output/unposed_reconstruction",
@@ -1244,6 +1663,7 @@ def estimate_poses_and_pointcloud(
     no_intrinsics: bool = False,
     no_secondary: bool = False,
     no_primary: bool = False,
+    single_world: bool = False,
     model: Optional[object] = None,
     model_name: str = "facebook/map-anything",
     device: Optional[str] = None,
@@ -1260,9 +1680,12 @@ def estimate_poses_and_pointcloud(
     """
     Run --mode auto|poses|calibrate over one scene or an LDA multi-scene root.
 
+    With single_world=True, all scenes are inferred jointly into one shared world
+    and written under <output>/single_world/ (no per-scene folders).
+
     Returns:
         List of (final_used_poses, final_used_intrinsics, filenames, ply_path)
-        per scene.
+        — one entry for single_world, otherwise one per scene.
     """
     if mode not in ("auto", "poses", "calibrate"):
         raise ValueError(
@@ -1271,6 +1694,11 @@ def estimate_poses_and_pointcloud(
     if no_secondary and no_primary:
         raise ValueError(
             "Cannot combine --no_secondary and --no_primary (nothing would remain)."
+        )
+    if single_world and mode == "auto" and chunk_size is not None and chunk_size > 0:
+        raise ValueError(
+            "--single_world with --mode auto cannot use --chunk_size "
+            "(would split into disconnected View-0 worlds)."
         )
 
     # If a list/comma path slipped through, use first directory-like entry.
@@ -1282,6 +1710,11 @@ def estimate_poses_and_pointcloud(
         print(f"Discovered {len(scenes)} scene(s) under: {images}")
         for s in scenes:
             print(f"  - {s.name}")
+        if single_world:
+            print(
+                "[single_world] Joint inference → one shared world under "
+                "output/.../single_world/"
+            )
 
     from mapanything.models import MapAnything
     from mapanything.utils.device import get_device
@@ -1296,6 +1729,48 @@ def estimate_poses_and_pointcloud(
             print(f"Loading MapAnything checkpoint: {model_name}...")
         model = MapAnything.from_pretrained(model_name).to(device)
     model.eval()
+
+    if single_world:
+        if mode == "auto":
+            result = run_single_world_auto(
+                scenes=scenes,
+                output=output,
+                model=model,
+                device=device,
+                no_secondary=no_secondary,
+                no_primary=no_primary,
+                minibatch_size=minibatch_size,
+                chunk_size=chunk_size,
+                apply_confidence_mask=apply_confidence_mask,
+                confidence_percentile=confidence_percentile,
+                use_multiview_confidence=use_multiview_confidence,
+                voxel_size=voxel_size,
+                dense=dense,
+                max_depth=max_depth,
+                verbose=verbose,
+            )
+        else:
+            result = run_single_world_posed(
+                scenes=scenes,
+                output=output,
+                model=model,
+                device=device,
+                mode_label=mode,
+                use_predicted_poses=(mode == "calibrate"),
+                no_intrinsics=no_intrinsics,
+                no_secondary=no_secondary,
+                no_primary=no_primary,
+                minibatch_size=minibatch_size,
+                chunk_size=chunk_size,
+                apply_confidence_mask=apply_confidence_mask,
+                confidence_percentile=confidence_percentile,
+                use_multiview_confidence=use_multiview_confidence,
+                voxel_size=voxel_size,
+                dense=dense,
+                max_depth=max_depth,
+                verbose=verbose,
+            )
+        return [result]
 
     results = []
     for scene_dir in scenes:
@@ -1358,7 +1833,8 @@ def main() -> None:
         description=(
             "MapAnything three-mode reconstruction: auto (images-only), "
             "poses (exact GT cameras), calibrate (GT baseline + model-refined cameras). "
-            "Always saves the final used poses/intrinsics + pointcloud.ply."
+            "Always saves the final used poses/intrinsics + pointcloud.ply. "
+            "With --single_world, all scenes are inferred jointly into one shared world."
         )
     )
     parser.add_argument(
@@ -1388,7 +1864,20 @@ def main() -> None:
         default=["output/unposed_reconstruction"],
         help=(
             "Output dir or .ply path (default: output/unposed_reconstruction). "
-            "Artifacts land in <output>/<scene_name>/."
+            "Per-scene: <output>/<scene_name>/. "
+            "With --single_world: <output>/single_world/ only."
+        ),
+    )
+    parser.add_argument(
+        "--single_world",
+        action="store_true",
+        help=(
+            "Joint multi-scene inference into one shared world "
+            "(writes <output>/single_world/ only; no jobdata). "
+            "auto: one images-only pass (all faces, one View-0 world; "
+            "incompatible with --chunk_size). "
+            "poses: one GT-conditioned cloud; cameras stay INPUT GT. "
+            "calibrate: all faces soft-calibrated into shared arkitWorld."
         ),
     )
     parser.add_argument(
@@ -1486,6 +1975,18 @@ def main() -> None:
     args = parser.parse_args()
     if args.no_secondary and args.no_primary:
         parser.error("Cannot combine --no_secondary and --no_primary")
+    if (
+        args.single_world
+        and args.mode == "auto"
+        and args.chunk_size is not None
+        and args.chunk_size > 0
+    ):
+        parser.error(
+            "--single_world with --mode auto cannot use --chunk_size "
+            "(chunking would split into disconnected View-0 worlds)"
+        )
+    if args.single_world and args.poses is not None:
+        parser.error("--poses is not supported with --single_world (per-scene JSON auto-detected)")
 
     images_input = _parse_path_args(args.input)
     if isinstance(images_input, list):
@@ -1510,6 +2011,7 @@ def main() -> None:
         no_intrinsics=args.no_intrinsics,
         no_secondary=args.no_secondary,
         no_primary=args.no_primary,
+        single_world=args.single_world,
         model_name=model_name,
         device=args.device,
         minibatch_size=args.minibatch_size,
