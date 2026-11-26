@@ -279,6 +279,143 @@ def find_poses_json(scene_dir: Path, poses_override: Optional[Union[str, Path]] 
     return matches[0]
 
 
+def _frame_basename(fr: dict) -> Optional[str]:
+    """Extract image basename from a pose-JSON frame record."""
+    img_field = fr.get("image") or fr.get("image_name") or ""
+    basename = Path(str(img_field)).name
+    if basename:
+        return basename
+    idx = fr.get("index")
+    if idx is not None:
+        return f"{idx}.jpg"
+    return None
+
+
+def frame_basenames(
+    poses_json: Union[str, Path],
+    *,
+    secondary: bool,
+) -> List[str]:
+    """
+    Basenames from pose JSON filtered by secondary flag.
+
+    secondary=False → primary frames (secondary is not True; missing field = primary)
+    secondary=True  → secondary frames only (secondary is True)
+    """
+    data = _load_json_strip_comments(poses_json)
+    frames = data.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError(f"Pose JSON missing non-empty 'frames': {poses_json}")
+
+    out: List[str] = []
+    for fr in frames:
+        is_secondary = fr.get("secondary") is True
+        if secondary and not is_secondary:
+            continue
+        if not secondary and is_secondary:
+            continue
+        basename = _frame_basename(fr)
+        if basename:
+            out.append(basename)
+    return out
+
+
+def primary_image_basenames(poses_json: Union[str, Path]) -> List[str]:
+    """Basenames of primary frames (secondary is not True)."""
+    return frame_basenames(poses_json, secondary=False)
+
+
+def secondary_image_basenames(poses_json: Union[str, Path]) -> List[str]:
+    """Basenames of secondary frames (secondary is True)."""
+    return frame_basenames(poses_json, secondary=True)
+
+
+def filter_images_by_secondary(
+    image_paths: List[str],
+    image_filenames: List[str],
+    poses_json: Union[str, Path],
+    *,
+    keep_secondary: bool,
+    verbose: bool = True,
+) -> Tuple[List[str], List[str]]:
+    """
+    Filter images by secondary flag in the pose JSON.
+
+    keep_secondary=False → --no_secondary (primary only)
+    keep_secondary=True  → --no_primary (secondary only)
+    """
+    wanted = set(frame_basenames(poses_json, secondary=keep_secondary))
+    kept_paths: List[str] = []
+    kept_names: List[str] = []
+    for path, name in zip(image_paths, image_filenames):
+        if name in wanted:
+            kept_paths.append(path)
+            kept_names.append(name)
+
+    label = "secondary" if keep_secondary else "primary"
+    flag = "--no_primary" if keep_secondary else "--no_secondary"
+    if not kept_paths:
+        raise ValueError(
+            f"No {label} images left after {flag} using {poses_json}"
+        )
+
+    if verbose:
+        print(
+            f"Kept {len(kept_names)}/{len(image_filenames)} {label} frames ({flag})"
+        )
+    return kept_paths, kept_names
+
+
+def filter_images_no_secondary(
+    image_paths: List[str],
+    image_filenames: List[str],
+    poses_json: Union[str, Path],
+    verbose: bool = True,
+) -> Tuple[List[str], List[str]]:
+    """Keep only primary (non-secondary) frames."""
+    return filter_images_by_secondary(
+        image_paths,
+        image_filenames,
+        poses_json,
+        keep_secondary=False,
+        verbose=verbose,
+    )
+
+
+def apply_secondary_frame_filter(
+    image_paths: List[str],
+    image_filenames: List[str],
+    poses_json: Union[str, Path],
+    *,
+    no_secondary: bool = False,
+    no_primary: bool = False,
+    verbose: bool = True,
+) -> Tuple[List[str], List[str]]:
+    """Apply --no_secondary / --no_primary (mutually exclusive)."""
+    if no_secondary and no_primary:
+        raise ValueError(
+            "Cannot combine --no_secondary and --no_primary "
+            "(nothing would remain)."
+        )
+    if no_secondary:
+        return filter_images_by_secondary(
+            image_paths,
+            image_filenames,
+            poses_json,
+            keep_secondary=False,
+            verbose=verbose,
+        )
+    if no_primary:
+        return filter_images_by_secondary(
+            image_paths,
+            image_filenames,
+            poses_json,
+            keep_secondary=True,
+            verbose=verbose,
+        )
+    return image_paths, image_filenames
+
+
 def _mat4_to_column_major_list(mat: np.ndarray) -> List[float]:
     m = np.asarray(mat, dtype=np.float64).reshape(4, 4)
     return m.reshape(-1, order="F").tolist()
@@ -719,6 +856,9 @@ def run_scene_auto(
     model: object,
     device: str,
     minibatch_size: int = 1,
+    no_secondary: bool = False,
+    no_primary: bool = False,
+    poses_path: Optional[Union[str, Path]] = None,
     apply_confidence_mask: bool = False,
     confidence_percentile: float = 10.0,
     use_multiview_confidence: bool = False,
@@ -731,6 +871,17 @@ def run_scene_auto(
     from mapanything.utils.image import load_images
 
     image_paths, image_filenames = find_images(scene_dir)
+    if no_secondary or no_primary:
+        pose_json = find_poses_json(scene_dir, poses_override=poses_path)
+        image_paths, image_filenames = apply_secondary_frame_filter(
+            image_paths,
+            image_filenames,
+            pose_json,
+            no_secondary=no_secondary,
+            no_primary=no_primary,
+            verbose=verbose,
+        )
+
     num_views = len(image_paths)
     scene_name = scene_dir.name
     ply_file, target_dir = _resolve_scene_output(output, scene_dir)
@@ -818,6 +969,8 @@ def _run_scene_posed(
     use_predicted_poses: bool,
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
     minibatch_size: int = 1,
     chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
@@ -842,11 +995,20 @@ def _run_scene_posed(
     torch = _ensure_torch()
 
     image_paths, image_filenames = find_images(scene_dir)
+    pose_json = find_poses_json(scene_dir, poses_override=poses_path)
+    image_paths, image_filenames = apply_secondary_frame_filter(
+        image_paths,
+        image_filenames,
+        pose_json,
+        no_secondary=no_secondary,
+        no_primary=no_primary,
+        verbose=verbose,
+    )
+
     num_views = len(image_paths)
     scene_name = scene_dir.name
     ply_file, target_dir = _resolve_scene_output(output, scene_dir)
 
-    pose_json = find_poses_json(scene_dir, poses_override=poses_path)
     input_poses, input_intrinsics = load_lda_poses_json(pose_json, image_filenames)
     if no_intrinsics:
         input_intrinsics = None
@@ -992,6 +1154,8 @@ def run_scene_poses(
     device: str,
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
     minibatch_size: int = 1,
     chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
@@ -1012,6 +1176,8 @@ def run_scene_poses(
         use_predicted_poses=False,
         poses_path=poses_path,
         no_intrinsics=no_intrinsics,
+        no_secondary=no_secondary,
+        no_primary=no_primary,
         minibatch_size=minibatch_size,
         chunk_size=chunk_size,
         apply_confidence_mask=apply_confidence_mask,
@@ -1031,6 +1197,8 @@ def run_scene_calibrate(
     device: str,
     poses_path: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
     minibatch_size: int = 1,
     chunk_size: Optional[int] = None,
     apply_confidence_mask: bool = False,
@@ -1054,6 +1222,8 @@ def run_scene_calibrate(
         use_predicted_poses=True,
         poses_path=poses_path,
         no_intrinsics=no_intrinsics,
+        no_secondary=no_secondary,
+        no_primary=no_primary,
         minibatch_size=minibatch_size,
         chunk_size=chunk_size,
         apply_confidence_mask=apply_confidence_mask,
@@ -1072,6 +1242,8 @@ def estimate_poses_and_pointcloud(
     mode: str = "auto",
     poses: Optional[Union[str, Path]] = None,
     no_intrinsics: bool = False,
+    no_secondary: bool = False,
+    no_primary: bool = False,
     model: Optional[object] = None,
     model_name: str = "facebook/map-anything",
     device: Optional[str] = None,
@@ -1095,6 +1267,10 @@ def estimate_poses_and_pointcloud(
     if mode not in ("auto", "poses", "calibrate"):
         raise ValueError(
             f"mode must be 'auto', 'poses', or 'calibrate', got: {mode!r}"
+        )
+    if no_secondary and no_primary:
+        raise ValueError(
+            "Cannot combine --no_secondary and --no_primary (nothing would remain)."
         )
 
     # If a list/comma path slipped through, use first directory-like entry.
@@ -1123,6 +1299,13 @@ def estimate_poses_and_pointcloud(
 
     results = []
     for scene_dir in scenes:
+        poses_override = poses if len(scenes) == 1 else None
+        if poses is not None and len(scenes) > 1 and verbose:
+            print(
+                "[warn] --poses ignored for multi-scene batch; "
+                "auto-detecting per-scene JSON."
+            )
+
         if mode == "auto":
             result = run_scene_auto(
                 scene_dir=scene_dir,
@@ -1130,6 +1313,9 @@ def estimate_poses_and_pointcloud(
                 model=model,
                 device=device,
                 minibatch_size=minibatch_size,
+                no_secondary=no_secondary,
+                no_primary=no_primary,
+                poses_path=poses_override,
                 apply_confidence_mask=apply_confidence_mask,
                 confidence_percentile=confidence_percentile,
                 use_multiview_confidence=use_multiview_confidence,
@@ -1139,13 +1325,6 @@ def estimate_poses_and_pointcloud(
                 verbose=verbose,
             )
         else:
-            # --poses override only makes sense for a single scene
-            poses_override = poses if len(scenes) == 1 else None
-            if poses is not None and len(scenes) > 1 and verbose:
-                print(
-                    "[warn] --poses ignored for multi-scene batch; "
-                    "auto-detecting per-scene JSON."
-                )
             posed_kwargs = dict(
                 scene_dir=scene_dir,
                 output=output,
@@ -1153,6 +1332,8 @@ def estimate_poses_and_pointcloud(
                 device=device,
                 poses_path=poses_override,
                 no_intrinsics=no_intrinsics,
+                no_secondary=no_secondary,
+                no_primary=no_primary,
                 minibatch_size=minibatch_size,
                 chunk_size=chunk_size,
                 apply_confidence_mask=apply_confidence_mask,
@@ -1224,6 +1405,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no_secondary",
+        action="store_true",
+        help=(
+            "Drop frames with secondary=true in the pose JSON; keep only primary "
+            "images (requires *_poses_world_opencv_rdf.json, including for --mode auto). "
+            "Mutually exclusive with --no_primary."
+        ),
+    )
+    parser.add_argument(
+        "--no_primary",
+        action="store_true",
+        help=(
+            "Drop primary frames; keep only secondary=true images from the pose JSON "
+            "(requires *_poses_world_opencv_rdf.json, including for --mode auto). "
+            "Mutually exclusive with --no_secondary."
+        ),
+    )
+    parser.add_argument(
         "--apache",
         action="store_true",
         help="Use facebook/map-anything-apache checkpoint",
@@ -1285,6 +1484,8 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.no_secondary and args.no_primary:
+        parser.error("Cannot combine --no_secondary and --no_primary")
 
     images_input = _parse_path_args(args.input)
     if isinstance(images_input, list):
@@ -1307,6 +1508,8 @@ def main() -> None:
         mode=args.mode,
         poses=args.poses,
         no_intrinsics=args.no_intrinsics,
+        no_secondary=args.no_secondary,
+        no_primary=args.no_primary,
         model_name=model_name,
         device=args.device,
         minibatch_size=args.minibatch_size,
