@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-Calibrate two perspective images by conditioning MapAnything on their poses.
+Two-view MapAnything reconstruction with an auto mode and a condition mode.
 
-Same injection as reconstruct_from_posed_images_v3.py depth_mode=condition, with
-poses instead of depth. Both photos, their K, and their cam-to-world poses go
-into one infer call. Depth is not passed. The saved cameras, scale, and cloud
-are the model's outputs, lifted into the shared ARKit world by the first camera:
+Both modes pass the two photos and their K. Neither passes depth.
 
-    T_world_i = T_gt_anchor @ inv(T_pred_0) @ T_pred_i
+  auto       No pose prior. The cloud and cameras are the model's view-0 outputs.
+  condition  JSON cam-to-world poses are injected, like v3 depth_mode=condition
+             injects depth. Exported cameras are
+             T_world_i = T_gt_anchor @ inv(T_pred_0) @ T_pred_i.
 
-The script writes:
-
-  pointcloud.ply
-  cameras.json          poses, metric scale, fx/fy/cx/cy, both camera centers
-  depths/<stem>_depth.npy   per-pixel s = camera-frame Z
+Writes pointcloud.ply, cameras.json, and depths/<stem>_depth.npy (s = Z).
 
 Usage:
-    python scripts/calibrate_two_perspective_images.py ^
+    python scripts/calibrate_two_perspective_images.py --mode auto ^
         --input C:\\Users\\A-511\\Downloads\\single_face ^
-        --output output/single_face_calibrated
+        --output output/single_face_auto
+    python scripts/calibrate_two_perspective_images.py --mode condition ^
+        --input C:\\Users\\A-511\\Downloads\\single_face ^
+        --output output/single_face_condition
 """
 
 from __future__ import annotations
@@ -344,6 +343,7 @@ def run_calibration(
     input_dir: Path,
     output_dir: Path,
     *,
+    mode: str,
     voxel_size: Optional[float] = 0.01,
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
@@ -362,16 +362,25 @@ def run_calibration(
     except ModuleNotFoundError:
         from reconstruct_from_posed_images_v3 import export_point_cloud
 
+    if mode not in ("auto", "condition"):
+        raise ValueError(f"mode must be 'auto' or 'condition', got {mode!r}")
+    use_pose_prior = mode == "condition"
+
     views = discover_views(input_dir)
     print(f"Input: {input_dir}")
+    print(f"Mode: {mode}")
     print(f"Paired {len(views)} perspective images:")
     for view in views:
         center = view["c2w"][:3, 3]
         k = view["intrinsics"]
+        pose_note = (
+            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+            if use_pose_prior
+            else "pose prior off"
+        )
         print(
             f"  {view['image_path'].name}  scene={view['scene_id']}  "
-            f"frame={view['frame_index']}  "
-            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})  "
+            f"frame={view['frame_index']}  {pose_note}  "
             f"K=({k[0, 0]:.1f}, {k[1, 1]:.1f}, {k[0, 2]:.1f}, {k[1, 2]:.1f})"
         )
 
@@ -382,8 +391,12 @@ def run_calibration(
     model.eval()
     use_amp, amp_dtype = _amp_settings(str(device))
     print(f"[Model] Device: {device}, Mixed Precision AMP: {amp_dtype.upper()}")
-    print("[Mode] Pose conditioning, no depth (v3 condition path with poses)")
-    print("[Mode] Export the model's calibrated pose, scale, K, and cloud")
+    if use_pose_prior:
+        print("[Mode] condition: inject JSON poses, no depth")
+        print("[Mode] Export T_gt_anchor @ inv(T_pred_0) @ T_pred")
+    else:
+        print("[Mode] auto: images and K only, no pose prior")
+        print("[Mode] Export the model's view-0 poses, scale, K, and cloud")
 
     loaded_images: List[np.ndarray] = []
     image_sizes: List[Tuple[int, int]] = []
@@ -400,14 +413,14 @@ def run_calibration(
 
     raw_views = []
     for view, rgb in zip(views, loaded_images):
-        raw_views.append(
-            {
-                "img": torch.from_numpy(rgb),
-                "intrinsics": torch.from_numpy(view["intrinsics"].astype(np.float32)),
-                "camera_poses": torch.from_numpy(view["c2w"].astype(np.float32)),
-                "is_metric_scale": torch.tensor([True]),
-            }
-        )
+        view_dict: Dict[str, Any] = {
+            "img": torch.from_numpy(rgb),
+            "intrinsics": torch.from_numpy(view["intrinsics"].astype(np.float32)),
+            "is_metric_scale": torch.tensor([True]),
+        }
+        if use_pose_prior:
+            view_dict["camera_poses"] = torch.from_numpy(view["c2w"].astype(np.float32))
+        raw_views.append(view_dict)
     processed_views = preprocess_inputs(raw_views, verbose=False)
 
     for view, processed in zip(views, processed_views):
@@ -432,8 +445,8 @@ def run_calibration(
             mask_edges=True,
             ignore_calibration_inputs=False,
             ignore_depth_inputs=True,
-            ignore_pose_inputs=False,
-            ignore_pose_scale_inputs=False,
+            ignore_pose_inputs=not use_pose_prior,
+            ignore_pose_scale_inputs=not use_pose_prior,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -447,23 +460,31 @@ def run_calibration(
         ],
         axis=0,
     )
-    world_poses = map_predicted_poses_to_world(pred_poses, views[0]["c2w"])
+    if use_pose_prior:
+        world_poses = map_predicted_poses_to_world(pred_poses, views[0]["c2w"])
+    else:
+        world_poses = pred_poses.astype(np.float64)
     metric_scales = [_metric_scale(pred) for pred in outputs]
     anchor_name = views[0]["image_path"].name
     print(
-        f"[Poses] Anchor '{anchor_name}'. "
-        f"Latent view-0 translation {pred_poses[0][:3, 3].round(4).tolist()}. "
+        f"[Poses] View 0 '{anchor_name}'. "
+        f"Predicted translation {pred_poses[0][:3, 3].round(4).tolist()}. "
         f"Metric scale {metric_scales[0]:.6f}"
     )
     for view, pose in zip(views, world_poses):
-        input_center = view["c2w"][:3, 3]
         center = pose[:3, 3]
-        delta = center - input_center
-        print(
-            f"  calibrated {view['image_path'].name}: "
-            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})  "
-            f"shift={float(np.linalg.norm(delta)):.3f} m from input"
-        )
+        if use_pose_prior:
+            delta = center - view["c2w"][:3, 3]
+            print(
+                f"  calibrated {view['image_path'].name}: "
+                f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})  "
+                f"shift={float(np.linalg.norm(delta)):.3f} m from input"
+            )
+        else:
+            print(
+                f"  view-0 {view['image_path'].name}: "
+                f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+            )
 
     all_points: List[np.ndarray] = []
     all_colors: List[np.ndarray] = []
@@ -543,13 +564,18 @@ def run_calibration(
                     "y": float(center[1]),
                     "z": float(center[2]),
                 },
-                "latentCameraToWorld": _mat4_to_column_major_list(latent_pose),
                 "cameraToWorld": _mat4_to_column_major_list(c2w_np),
                 "worldToCamera": _mat4_to_column_major_list(w2c),
-                "inputCameraToWorld": _mat4_to_column_major_list(view["c2w"]),
                 "depth": depth_rel,
             }
         )
+        if use_pose_prior:
+            camera_records[-1]["latentCameraToWorld"] = _mat4_to_column_major_list(
+                latent_pose
+            )
+            camera_records[-1]["inputCameraToWorld"] = _mat4_to_column_major_list(
+                view["c2w"]
+            )
         print(
             f"  {view['image_path'].name}: "
             f"{len(pts_np):,} points, "
@@ -577,17 +603,16 @@ def run_calibration(
         verbose=True,
     )
 
-    cameras_payload = {
-        "comment": (
-            "Pose conditioning, no depth. Both images, K, and cam-to-world poses "
-            "were injected the way v3 depth_mode=condition injects depth_z. "
-            "cameraToWorld, metricScale, and intrinsics are the model outputs. "
+    if use_pose_prior:
+        comment = (
+            "condition: JSON poses were injected and no depth was passed. "
             "cameraToWorld is T_gt_anchor @ inv(T_pred_0) @ T_pred_i. "
+            "metricScale and intrinsics are the model outputs. "
             "intrinsicsNetwork is the K used to unproject the depth map (s = Z). "
             "intrinsicsImage is that K mapped back onto the original photo. "
             "inputCameraToWorld is the pose that was conditioned on."
-        ),
-        "convention": {
+        )
+        convention = {
             "frame": "arkitWorld",
             "cameraAxes": "opencvRDF",
             "axes": (
@@ -597,14 +622,43 @@ def run_calibration(
             "units": "meters",
             "matrixOrder": "columnMajor",
             "projection": "s [u, v, 1]^T = K [X, Y, Z]^T with s = Z",
-        },
-        "source": {
-            "mode": "pose_condition",
+        }
+        source = {
+            "mode": "condition",
             "poseMap": "T_gt_anchor @ inv(T_pred_0) @ T_pred_i",
             "anchorImage": anchor_name,
             "input": str(input_dir),
             "maxDepthMeters": max_depth,
-        },
+        }
+    else:
+        comment = (
+            "auto: images and K only. No pose prior. "
+            "cameraToWorld is the model's view-0 pose. "
+            "metricScale and intrinsics are the model outputs. "
+            "intrinsicsNetwork is the K used to unproject the depth map (s = Z). "
+            "intrinsicsImage is that K mapped back onto the original photo."
+        )
+        convention = {
+            "frame": "view0World",
+            "cameraAxes": "opencvRDF",
+            "axes": (
+                "world: MapAnything view-0 frame (first camera near the origin, meters); "
+                "camera: OpenCV RDF (+X right, +Y down, +Z forward)"
+            ),
+            "units": "meters",
+            "matrixOrder": "columnMajor",
+            "projection": "s [u, v, 1]^T = K [X, Y, Z]^T with s = Z",
+        }
+        source = {
+            "mode": "auto",
+            "poseMap": "predicted view-0 camera_poses",
+            "input": str(input_dir),
+            "maxDepthMeters": max_depth,
+        }
+    cameras_payload = {
+        "comment": comment,
+        "convention": convention,
+        "source": source,
         "cameras": camera_records,
     }
     cameras_path = output_dir / "cameras.json"
@@ -620,10 +674,19 @@ def run_calibration(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Condition MapAnything on both images, their K, and their poses "
-            "(no depth), then save the model's calibrated point cloud, poses, "
-            "metric scale, and fx/fy/cx/cy."
+            "Reconstruct two perspective images. "
+            "auto uses the model with no pose prior. "
+            "condition injects the JSON poses and saves the refined cameras."
         )
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["auto", "condition"],
+        help=(
+            "auto = images and K only, export the model's view-0 cameras; "
+            "condition = inject JSON poses, export T_gt_anchor @ inv(T_pred_0) @ T_pred"
+        ),
     )
     parser.add_argument(
         "--input",
@@ -679,6 +742,7 @@ def main() -> None:
     run_calibration(
         input_dir=Path(_join_path_args(args.input)),
         output_dir=Path(_join_path_args(args.output)),
+        mode=args.mode,
         voxel_size=None if args.dense else args.voxel_size,
         dense=args.dense,
         max_depth=args.max_depth,
