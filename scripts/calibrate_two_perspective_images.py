@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Calibrate two perspective images with MapAnything.
+Calibrate two perspective images by conditioning MapAnything on their poses.
 
-One joint infer call gets both photos, their pinhole K, and their OpenCV RDF
-cam-to-world poses. The model returns cameras in the first view's frame.
-Those are mapped into the shared ARKit world with T_world = T_gt_anchor @ T_pred
-and the depth is unprojected with that calibrated pose.
+Same injection as reconstruct_from_posed_images_v3.py depth_mode=condition, with
+poses instead of depth. Both photos, their K, and their cam-to-world poses go
+into one infer call. Depth is not passed. The saved cameras, scale, and cloud
+are the model's outputs, lifted into the shared ARKit world by the first camera:
+
+    T_world_i = T_gt_anchor @ inv(T_pred_0) @ T_pred_i
 
 The script writes:
 
   pointcloud.ply
-  cameras.json          fx, fy, cx, cy, poses, and both camera centers
+  cameras.json          poses, metric scale, fx/fy/cx/cy, both camera centers
   depths/<stem>_depth.npy   per-pixel s = camera-frame Z
 
 Usage:
@@ -304,17 +306,29 @@ def map_predicted_poses_to_world(
     pred_poses: np.ndarray,
     anchor_c2w: np.ndarray,
 ) -> np.ndarray:
-    """Map view-0 predicted cam-to-world poses into the anchor camera's world.
+    """Lift latent cam-to-world poses into the anchor camera's world.
 
-    MapAnything returns poses in the first view's frame. Left-multiplying by
-    that view's input cam-to-world puts both cameras in the shared ARKit world:
-    T_world_i = T_gt_anchor @ T_pred_i.
+    MapAnything returns poses in its own frame, with view 0 near the origin.
+    Removing that view-0 pose and applying the anchor keeps the first camera
+    on its known world pose and carries the solved relative pose:
+
+        T_world_i = T_gt_anchor @ inv(T_pred_0) @ T_pred_i
     """
     anchor = np.asarray(anchor_c2w, dtype=np.float64)
+    pred0 = np.asarray(pred_poses[0], dtype=np.float64)
+    world_from_latent = anchor @ np.linalg.inv(pred0)
     mapped = np.empty((len(pred_poses), 4, 4), dtype=np.float64)
     for index, pred in enumerate(pred_poses):
-        mapped[index] = anchor @ np.asarray(pred, dtype=np.float64)
+        mapped[index] = world_from_latent @ np.asarray(pred, dtype=np.float64)
     return mapped
+
+
+def _metric_scale(pred: dict) -> float:
+    value = pred["metric_scaling_factor"]
+    if hasattr(value, "detach"):
+        value = value.detach().float().cpu().numpy()
+    scales = np.asarray(value, dtype=np.float64).reshape(-1)
+    return float(scales[0])
 
 
 def _depth_for_export(depth_z, max_depth: Optional[float]) -> np.ndarray:
@@ -368,14 +382,14 @@ def run_calibration(
     model.eval()
     use_amp, amp_dtype = _amp_settings(str(device))
     print(f"[Model] Device: {device}, Mixed Precision AMP: {amp_dtype.upper()}")
-    print("[Mode] Joint infer on both images with input poses and intrinsics")
-    print("[Mode] Export T_gt_anchor @ predicted pose, unproject with that camera")
+    print("[Mode] Pose conditioning, no depth (v3 condition path with poses)")
+    print("[Mode] Export the model's calibrated pose, scale, K, and cloud")
 
     loaded_images: List[np.ndarray] = []
     image_sizes: List[Tuple[int, int]] = []
     for view in views:
         with Image.open(view["image_path"]) as img:
-            rgb = np.asarray(img.convert("RGB"))
+            rgb = np.array(img.convert("RGB"), copy=True)
         loaded_images.append(rgb)
         height, width = rgb.shape[:2]
         image_sizes.append((width, height))
@@ -434,23 +448,28 @@ def run_calibration(
         axis=0,
     )
     world_poses = map_predicted_poses_to_world(pred_poses, views[0]["c2w"])
+    metric_scales = [_metric_scale(pred) for pred in outputs]
     anchor_name = views[0]["image_path"].name
     print(
         f"[Poses] Anchor '{anchor_name}'. "
-        f"Predicted view-0 translation {pred_poses[0][:3, 3].round(4).tolist()}"
+        f"Latent view-0 translation {pred_poses[0][:3, 3].round(4).tolist()}. "
+        f"Metric scale {metric_scales[0]:.6f}"
     )
     for view, pose in zip(views, world_poses):
+        input_center = view["c2w"][:3, 3]
         center = pose[:3, 3]
+        delta = center - input_center
         print(
             f"  calibrated {view['image_path'].name}: "
-            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})  "
+            f"shift={float(np.linalg.norm(delta)):.3f} m from input"
         )
 
     all_points: List[np.ndarray] = []
     all_colors: List[np.ndarray] = []
     camera_records: List[Dict[str, Any]] = []
 
-    for view, pred, c2w_np in zip(views, outputs, world_poses):
+    for view_index, (view, pred, c2w_np) in enumerate(zip(views, outputs, world_poses)):
         depth_z = pred["depth_z"][0].squeeze(-1)
         intrinsics_view = pred["intrinsics"][0]
         mask = pred["mask"][0].squeeze(-1).bool()
@@ -496,12 +515,15 @@ def run_calibration(
         w2c = np.linalg.inv(c2w_np)
         network_intr = _matrix_to_intrinsics_dict(k_network)
         original_intr = _matrix_to_intrinsics_dict(k_original)
+        latent_pose = pred_poses[view_index]
+        metric_scale = metric_scales[view_index]
 
         camera_records.append(
             {
                 "image": view["image_path"].name,
                 "scene": view["scene_id"],
                 "frameIndex": view["frame_index"],
+                "metricScale": metric_scale,
                 "networkImage": {"width": int(network_w), "height": int(network_h)},
                 "originalImage": {"width": int(original_w), "height": int(original_h)},
                 "intrinsicsNetwork": {
@@ -521,8 +543,10 @@ def run_calibration(
                     "y": float(center[1]),
                     "z": float(center[2]),
                 },
+                "latentCameraToWorld": _mat4_to_column_major_list(latent_pose),
                 "cameraToWorld": _mat4_to_column_major_list(c2w_np),
                 "worldToCamera": _mat4_to_column_major_list(w2c),
+                "inputCameraToWorld": _mat4_to_column_major_list(view["c2w"]),
                 "depth": depth_rel,
             }
         )
@@ -532,7 +556,8 @@ def run_calibration(
             f"network K fx={network_intr['fx']:.2f} fy={network_intr['fy']:.2f} "
             f"cx={network_intr['cx']:.2f} cy={network_intr['cy']:.2f}, "
             f"image K fx={original_intr['fx']:.2f} fy={original_intr['fy']:.2f} "
-            f"cx={original_intr['cx']:.2f} cy={original_intr['cy']:.2f}"
+            f"cx={original_intr['cx']:.2f} cy={original_intr['cy']:.2f}, "
+            f"scale={metric_scale:.6f}"
         )
 
     if not all_points:
@@ -554,11 +579,13 @@ def run_calibration(
 
     cameras_payload = {
         "comment": (
-            "Both images were inferred together with their input poses and K. "
-            "cameraToWorld is T_gt_anchor @ T_pred: the model's view-0 pose mapped "
-            "into the shared ARKit world by the first image's input camera. "
+            "Pose conditioning, no depth. Both images, K, and cam-to-world poses "
+            "were injected the way v3 depth_mode=condition injects depth_z. "
+            "cameraToWorld, metricScale, and intrinsics are the model outputs. "
+            "cameraToWorld is T_gt_anchor @ inv(T_pred_0) @ T_pred_i. "
             "intrinsicsNetwork is the K used to unproject the depth map (s = Z). "
-            "intrinsicsImage is that K mapped back onto the original photo."
+            "intrinsicsImage is that K mapped back onto the original photo. "
+            "inputCameraToWorld is the pose that was conditioned on."
         ),
         "convention": {
             "frame": "arkitWorld",
@@ -572,8 +599,8 @@ def run_calibration(
             "projection": "s [u, v, 1]^T = K [X, Y, Z]^T with s = Z",
         },
         "source": {
-            "mode": "mapanything_calibrate",
-            "poseMap": "T_gt_anchor @ T_pred",
+            "mode": "pose_condition",
+            "poseMap": "T_gt_anchor @ inv(T_pred_0) @ T_pred_i",
             "anchorImage": anchor_name,
             "input": str(input_dir),
             "maxDepthMeters": max_depth,
@@ -593,9 +620,9 @@ def run_calibration(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Infer both perspective images together with their poses and K, "
-            "map the predicted cameras into the shared world, and save the "
-            "point cloud, fx/fy/cx/cy, depth s=Z, and both camera coordinates."
+            "Condition MapAnything on both images, their K, and their poses "
+            "(no depth), then save the model's calibrated point cloud, poses, "
+            "metric scale, and fx/fy/cx/cy."
         )
     )
     parser.add_argument(
