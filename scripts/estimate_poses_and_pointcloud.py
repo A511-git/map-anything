@@ -24,14 +24,15 @@ Input may be a single scene folder or an LDA-style root with scene subfolders:
         9oPhlqgwrM_poses_world_opencv_rdf.json
       …
 
---single_world (multi-scene root):
-  Joint inference over all faces from all scenes → one shared world export under
-  <output>/single_world/ (no per-scene folders, no jobdata).
-    auto       — one images-only pass; model poses all faces in one View-0 world
-    poses      — one GT-conditioned depth/cloud pass; cameras stay INPUT GT
-    calibrate  — one GT-baseline pass; export T_gt_anchor @ T_pred in arkitWorld
+--depth_merge (multi-scene root → one shared world under <output>/single_world/):
+  post-hoc     — infer each scene separately, then concatenate clouds/poses
+                 (poses/calibrate only; GT already shares arkitWorld)
+  multi-scene  — one joint infer over all faces (alias: --single_world)
+    auto       — images-only; all faces in one View-0 world
+    poses      — GT-conditioned depth/cloud; cameras stay INPUT GT
+    calibrate  — GT-baseline; export T_gt_anchor @ T_pred in arkitWorld
 
-Without --single_world each scene is processed separately (auto = separate worlds).
+Without --depth_merge / --single_world each scene is processed separately.
 
 Usage:
     python scripts/estimate_poses_and_pointcloud.py \\
@@ -44,13 +45,14 @@ Usage:
         --mode poses \\
         --input path/to/LDA \\
         --output output/posed_reconstruction \\
-        --single_world \\
+        --depth_merge post-hoc \\
         --minibatch_size 1
 
     python scripts/estimate_poses_and_pointcloud.py \\
         --mode calibrate \\
         --input path/to/LDA \\
         --output output/calibrated_reconstruction \\
+        --depth_merge multi-scene \\
         --minibatch_size 1
 """
 
@@ -743,8 +745,72 @@ def _resolve_scene_output(
 
 
 def _resolve_single_world_output(output: Union[str, Path]) -> Tuple[str, Path]:
-    """Artifacts for --single_world land in <output>/single_world/."""
+    """Artifacts for --depth_merge / --single_world land in <output>/single_world/."""
     return _resolve_scene_output(output, Path("single_world"))
+
+
+def _write_depth_merge_bundle(
+    output: Union[str, Path],
+    *,
+    scene_names: List[str],
+    image_filenames: List[str],
+    poses: np.ndarray,
+    intrinsics: np.ndarray,
+    points: np.ndarray,
+    colors: np.ndarray,
+    source_mode: str,
+    depth_merge: str,
+    voxel_size: Optional[float],
+    dense: bool,
+    verbose: bool = True,
+) -> str:
+    """Write concatenated post-hoc / shared-world artifacts under single_world/."""
+    ply_file, target_dir = _resolve_single_world_output(output)
+
+    if verbose:
+        print(
+            f"\n=== [depth_merge={depth_merge}] Writing combined bundle "
+            f"({len(image_filenames)} cameras, {len(points):,} points) → {target_dir}"
+        )
+
+    lda_json_path = target_dir / "single_world_poses_world_opencv_rdf.json"
+    write_lda_poses_json(
+        lda_json_path,
+        scene_name="single_world",
+        image_filenames=image_filenames,
+        poses=poses,
+        intrinsics=intrinsics,
+        source_meta={
+            "mode": source_mode,
+            "depthMerge": depth_merge,
+            "singleWorld": True,
+            "scenes": scene_names,
+        },
+    )
+    if verbose:
+        print(f"Saved merged LDA poses JSON -> {lda_json_path}")
+
+    _save_npy_json_companions(
+        target_dir,
+        image_filenames,
+        poses,
+        intrinsics,
+        verbose=verbose,
+        source_mode=source_mode,
+    )
+
+    export_point_cloud, _ = _v3_io()
+    export_point_cloud(
+        output_path=ply_file,
+        points=points,
+        colors=colors,
+        voxel_size=voxel_size,
+        dense=dense,
+        verbose=verbose,
+    )
+    if verbose:
+        print(f"Saved merged point cloud -> {ply_file}")
+    return ply_file
 
 
 def collect_single_world_views(
@@ -980,7 +1046,7 @@ def run_scene_auto(
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], str, np.ndarray, np.ndarray]:
     """Images-only inference; export predicted LDA-schema poses + point cloud."""
     from mapanything.utils.image import load_images
 
@@ -1070,7 +1136,7 @@ def run_scene_auto(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return pred_poses, pred_intrinsics, image_filenames, ply_file
+    return pred_poses, pred_intrinsics, image_filenames, ply_file, points, colors
 
 
 def _run_scene_posed(
@@ -1094,7 +1160,7 @@ def _run_scene_posed(
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], str, np.ndarray, np.ndarray]:
     """
     Shared GT-conditioned inference for --mode poses|calibrate.
 
@@ -1258,7 +1324,7 @@ def _run_scene_posed(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return export_poses, export_intrinsics, image_filenames, ply_file
+    return export_poses, export_intrinsics, image_filenames, ply_file, points, colors
 
 
 def run_scene_poses(
@@ -1279,7 +1345,7 @@ def run_scene_poses(
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], str, np.ndarray, np.ndarray]:
     """GT-conditioned inference; unproject and save INPUT OpenCV-RDF poses."""
     return _run_scene_posed(
         scene_dir=scene_dir,
@@ -1322,7 +1388,7 @@ def run_scene_calibrate(
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[str], str]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], str, np.ndarray, np.ndarray]:
     """
     GT poses as latent baseline; export model-calibrated poses mapped into GT
     world (T_gt_anchor @ T_pred). Supports chunked inference for low VRAM.
@@ -1434,6 +1500,7 @@ def run_single_world_auto(
         intrinsics=pred_intrinsics,
         source_meta={
             "mode": "mapanything_auto",
+            "depthMerge": "multi-scene",
             "singleWorld": True,
             "scenes": bundle["scene_names"],
         },
@@ -1617,6 +1684,7 @@ def run_single_world_posed(
         intrinsics=export_intrinsics,
         source_meta={
             "mode": source_mode,
+            "depthMerge": "multi-scene",
             "singleWorld": True,
             "scenes": bundle["scene_names"],
             "gt_poses_json": bundle["pose_json_paths"],
@@ -1663,6 +1731,7 @@ def estimate_poses_and_pointcloud(
     no_intrinsics: bool = False,
     no_secondary: bool = False,
     no_primary: bool = False,
+    depth_merge: Optional[str] = None,
     single_world: bool = False,
     model: Optional[object] = None,
     model_name: str = "facebook/map-anything",
@@ -1676,16 +1745,21 @@ def estimate_poses_and_pointcloud(
     dense: bool = False,
     max_depth: Optional[float] = 25.0,
     verbose: bool = True,
-) -> List[Tuple[np.ndarray, np.ndarray, List[str], str]]:
+) -> List[Tuple[Any, ...]]:
     """
     Run --mode auto|poses|calibrate over one scene or an LDA multi-scene root.
 
-    With single_world=True, all scenes are inferred jointly into one shared world
-    and written under <output>/single_world/ (no per-scene folders).
+    depth_merge:
+      None         — per-scene only
+      'post-hoc'   — per-scene infer, then concat into <output>/single_world/
+      'multi-scene'— joint infer (same as single_world=True)
+
+    single_world=True is an alias for depth_merge='multi-scene'.
 
     Returns:
-        List of (final_used_poses, final_used_intrinsics, filenames, ply_path)
-        — one entry for single_world, otherwise one per scene.
+        Per-scene results as
+        (poses, intrinsics, filenames, ply_path, points, colors).
+        For multi-scene joint path: one 4-tuple entry (poses, K, names, ply).
     """
     if mode not in ("auto", "poses", "calibrate"):
         raise ValueError(
@@ -1695,9 +1769,34 @@ def estimate_poses_and_pointcloud(
         raise ValueError(
             "Cannot combine --no_secondary and --no_primary (nothing would remain)."
         )
-    if single_world and mode == "auto" and chunk_size is not None and chunk_size > 0:
+
+    # Resolve depth_merge vs legacy --single_world alias.
+    if single_world:
+        if depth_merge is None:
+            depth_merge = "multi-scene"
+        elif depth_merge != "multi-scene":
+            raise ValueError(
+                f"--single_world aliases depth_merge=multi-scene, but got "
+                f"depth_merge={depth_merge!r}"
+            )
+    if depth_merge is not None and depth_merge not in ("post-hoc", "multi-scene"):
         raise ValueError(
-            "--single_world with --mode auto cannot use --chunk_size "
+            f"depth_merge must be 'post-hoc' or 'multi-scene', got: {depth_merge!r}"
+        )
+    if depth_merge == "post-hoc" and mode == "auto":
+        raise ValueError(
+            "--depth_merge post-hoc is not supported with --mode auto "
+            "(each scene is its own View-0 world; use poses/calibrate or "
+            "--depth_merge multi-scene)."
+        )
+    if (
+        depth_merge == "multi-scene"
+        and mode == "auto"
+        and chunk_size is not None
+        and chunk_size > 0
+    ):
+        raise ValueError(
+            "--depth_merge multi-scene with --mode auto cannot use --chunk_size "
             "(would split into disconnected View-0 worlds)."
         )
 
@@ -1710,9 +1809,14 @@ def estimate_poses_and_pointcloud(
         print(f"Discovered {len(scenes)} scene(s) under: {images}")
         for s in scenes:
             print(f"  - {s.name}")
-        if single_world:
+        if depth_merge == "multi-scene":
             print(
-                "[single_world] Joint inference → one shared world under "
+                "[depth_merge=multi-scene] Joint inference → "
+                "output/.../single_world/"
+            )
+        elif depth_merge == "post-hoc":
+            print(
+                "[depth_merge=post-hoc] Per-scene infer, then concat → "
                 "output/.../single_world/"
             )
 
@@ -1730,7 +1834,7 @@ def estimate_poses_and_pointcloud(
         model = MapAnything.from_pretrained(model_name).to(device)
     model.eval()
 
-    if single_world:
+    if depth_merge == "multi-scene":
         if mode == "auto":
             result = run_single_world_auto(
                 scenes=scenes,
@@ -1772,7 +1876,7 @@ def estimate_poses_and_pointcloud(
             )
         return [result]
 
-    results = []
+    results: List[Tuple[Any, ...]] = []
     for scene_dir in scenes:
         poses_override = poses if len(scenes) == 1 else None
         if poses is not None and len(scenes) > 1 and verbose:
@@ -1825,6 +1929,43 @@ def estimate_poses_and_pointcloud(
                 result = run_scene_poses(**posed_kwargs)
         results.append(result)
 
+    if depth_merge == "post-hoc":
+        scene_names = [s.name for s in scenes]
+        all_names: List[str] = []
+        pose_parts: List[np.ndarray] = []
+        intrins_parts: List[np.ndarray] = []
+        point_parts: List[np.ndarray] = []
+        color_parts: List[np.ndarray] = []
+        for scene_name, (poses_i, intrins_i, names_i, _ply, pts_i, cols_i) in zip(
+            scene_names, results
+        ):
+            prefixed = [
+                n if ("/" in n or "\\" in n) else f"{scene_name}/{n}" for n in names_i
+            ]
+            all_names.extend(prefixed)
+            pose_parts.append(poses_i)
+            intrins_parts.append(intrins_i)
+            point_parts.append(pts_i)
+            color_parts.append(cols_i)
+
+        source_mode = (
+            "mapanything_calibrate" if mode == "calibrate" else "mapanything_poses"
+        )
+        _write_depth_merge_bundle(
+            output,
+            scene_names=scene_names,
+            image_filenames=all_names,
+            poses=np.concatenate(pose_parts, axis=0),
+            intrinsics=np.concatenate(intrins_parts, axis=0),
+            points=np.concatenate(point_parts, axis=0),
+            colors=np.concatenate(color_parts, axis=0),
+            source_mode=source_mode,
+            depth_merge="post-hoc",
+            voxel_size=voxel_size,
+            dense=dense,
+            verbose=verbose,
+        )
+
     return results
 
 
@@ -1834,7 +1975,7 @@ def main() -> None:
             "MapAnything three-mode reconstruction: auto (images-only), "
             "poses (exact GT cameras), calibrate (GT baseline + model-refined cameras). "
             "Always saves the final used poses/intrinsics + pointcloud.ply. "
-            "With --single_world, all scenes are inferred jointly into one shared world."
+            "Use --depth_merge post-hoc|multi-scene to combine scenes into one world."
         )
     )
     parser.add_argument(
@@ -1865,19 +2006,26 @@ def main() -> None:
         help=(
             "Output dir or .ply path (default: output/unposed_reconstruction). "
             "Per-scene: <output>/<scene_name>/. "
-            "With --single_world: <output>/single_world/ only."
+            "With --depth_merge / --single_world: also or only <output>/single_world/."
+        ),
+    )
+    parser.add_argument(
+        "--depth_merge",
+        type=str,
+        choices=["post-hoc", "multi-scene"],
+        default=None,
+        help=(
+            "Combine all scenes into <output>/single_world/. "
+            "post-hoc = per-scene infer then concatenate (poses/calibrate only). "
+            "multi-scene = one joint infer over all faces."
         ),
     )
     parser.add_argument(
         "--single_world",
         action="store_true",
         help=(
-            "Joint multi-scene inference into one shared world "
-            "(writes <output>/single_world/ only; no jobdata). "
-            "auto: one images-only pass (all faces, one View-0 world; "
-            "incompatible with --chunk_size). "
-            "poses: one GT-conditioned cloud; cameras stay INPUT GT. "
-            "calibrate: all faces soft-calibrated into shared arkitWorld."
+            "Alias for --depth_merge multi-scene "
+            "(joint multi-scene inference into <output>/single_world/)."
         ),
     )
     parser.add_argument(
@@ -1975,18 +2123,36 @@ def main() -> None:
     args = parser.parse_args()
     if args.no_secondary and args.no_primary:
         parser.error("Cannot combine --no_secondary and --no_primary")
+
+    depth_merge = args.depth_merge
+    if args.single_world:
+        if depth_merge is None:
+            depth_merge = "multi-scene"
+        elif depth_merge != "multi-scene":
+            parser.error(
+                "--single_world aliases --depth_merge multi-scene; "
+                f"cannot combine with --depth_merge {depth_merge}"
+            )
+    if depth_merge == "post-hoc" and args.mode == "auto":
+        parser.error(
+            "--depth_merge post-hoc requires --mode poses or calibrate "
+            "(auto scenes are separate View-0 worlds)"
+        )
     if (
-        args.single_world
+        depth_merge == "multi-scene"
         and args.mode == "auto"
         and args.chunk_size is not None
         and args.chunk_size > 0
     ):
         parser.error(
-            "--single_world with --mode auto cannot use --chunk_size "
+            "--depth_merge multi-scene with --mode auto cannot use --chunk_size "
             "(chunking would split into disconnected View-0 worlds)"
         )
-    if args.single_world and args.poses is not None:
-        parser.error("--poses is not supported with --single_world (per-scene JSON auto-detected)")
+    if depth_merge is not None and args.poses is not None:
+        parser.error(
+            "--poses is not supported with --depth_merge / --single_world "
+            "(per-scene JSON auto-detected)"
+        )
 
     images_input = _parse_path_args(args.input)
     if isinstance(images_input, list):
@@ -2011,7 +2177,8 @@ def main() -> None:
         no_intrinsics=args.no_intrinsics,
         no_secondary=args.no_secondary,
         no_primary=args.no_primary,
-        single_world=args.single_world,
+        depth_merge=depth_merge,
+        single_world=False,  # already folded into depth_merge above
         model_name=model_name,
         device=args.device,
         minibatch_size=args.minibatch_size,
