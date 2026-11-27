@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Calibrate two perspective images with the v3 posed-calibration call.
+Calibrate two perspective images with MapAnything.
 
-Same inference as scripts/reconstruct_from_posed_images_v3.py --use_pose_inputs:
-pass each photo with its pinhole K and its OpenCV RDF cam-to-world pose, then
-unproject with the intrinsics MapAnything returns and that input world pose.
+One joint infer call gets both photos, their pinhole K, and their OpenCV RDF
+cam-to-world poses. The model returns cameras in the first view's frame.
+Those are mapped into the shared ARKit world with T_world = T_gt_anchor @ T_pred
+and the depth is unprojected with that calibrated pose.
 
-Both input poses are already in one ARKit world. The script writes:
+The script writes:
 
   pointcloud.ply
   cameras.json          fx, fy, cx, cy, poses, and both camera centers
@@ -299,6 +300,23 @@ def _amp_settings(device: str) -> Tuple[bool, str]:
     return False, "fp32"
 
 
+def map_predicted_poses_to_world(
+    pred_poses: np.ndarray,
+    anchor_c2w: np.ndarray,
+) -> np.ndarray:
+    """Map view-0 predicted cam-to-world poses into the anchor camera's world.
+
+    MapAnything returns poses in the first view's frame. Left-multiplying by
+    that view's input cam-to-world puts both cameras in the shared ARKit world:
+    T_world_i = T_gt_anchor @ T_pred_i.
+    """
+    anchor = np.asarray(anchor_c2w, dtype=np.float64)
+    mapped = np.empty((len(pred_poses), 4, 4), dtype=np.float64)
+    for index, pred in enumerate(pred_poses):
+        mapped[index] = anchor @ np.asarray(pred, dtype=np.float64)
+    return mapped
+
+
 def _depth_for_export(depth_z, max_depth: Optional[float]) -> np.ndarray:
     depth = depth_z.detach().float().cpu().numpy().astype(np.float32)
     invalid = ~np.isfinite(depth)
@@ -350,7 +368,8 @@ def run_calibration(
     model.eval()
     use_amp, amp_dtype = _amp_settings(str(device))
     print(f"[Model] Device: {device}, Mixed Precision AMP: {amp_dtype.upper()}")
-    print("[Mode] v3 posed calibration: input world poses + intrinsics")
+    print("[Mode] Joint infer on both images with input poses and intrinsics")
+    print("[Mode] Export T_gt_anchor @ predicted pose, unproject with that camera")
 
     loaded_images: List[np.ndarray] = []
     image_sizes: List[Tuple[int, int]] = []
@@ -407,17 +426,37 @@ def run_calibration(
     depth_dir = output_dir / "depths"
     depth_dir.mkdir(parents=True, exist_ok=True)
 
+    pred_poses = np.stack(
+        [
+            pred["camera_poses"][0].detach().float().cpu().numpy()
+            for pred in outputs
+        ],
+        axis=0,
+    )
+    world_poses = map_predicted_poses_to_world(pred_poses, views[0]["c2w"])
+    anchor_name = views[0]["image_path"].name
+    print(
+        f"[Poses] Anchor '{anchor_name}'. "
+        f"Predicted view-0 translation {pred_poses[0][:3, 3].round(4).tolist()}"
+    )
+    for view, pose in zip(views, world_poses):
+        center = pose[:3, 3]
+        print(
+            f"  calibrated {view['image_path'].name}: "
+            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+        )
+
     all_points: List[np.ndarray] = []
     all_colors: List[np.ndarray] = []
     camera_records: List[Dict[str, Any]] = []
 
-    for view, pred in zip(views, outputs):
+    for view, pred, c2w_np in zip(views, outputs, world_poses):
         depth_z = pred["depth_z"][0].squeeze(-1)
         intrinsics_view = pred["intrinsics"][0]
         mask = pred["mask"][0].squeeze(-1).bool()
         img_no_norm = pred["img_no_norm"][0]
 
-        c2w = torch.from_numpy(view["c2w"].astype(np.float32)).to(
+        c2w = torch.from_numpy(c2w_np.astype(np.float32)).to(
             device=depth_z.device, dtype=depth_z.dtype
         )
         pts3d, valid_depth = depthmap_to_world_frame(depth_z, intrinsics_view, c2w)
@@ -453,8 +492,8 @@ def run_calibration(
             k_network, scale, rescale_offset, crop_left, crop_top
         )
         original_w, original_h = view["original_wh"]
-        center = view["c2w"][:3, 3]
-        w2c = np.linalg.inv(view["c2w"])
+        center = c2w_np[:3, 3]
+        w2c = np.linalg.inv(c2w_np)
         network_intr = _matrix_to_intrinsics_dict(k_network)
         original_intr = _matrix_to_intrinsics_dict(k_original)
 
@@ -482,7 +521,7 @@ def run_calibration(
                     "y": float(center[1]),
                     "z": float(center[2]),
                 },
-                "cameraToWorld": _mat4_to_column_major_list(view["c2w"]),
+                "cameraToWorld": _mat4_to_column_major_list(c2w_np),
                 "worldToCamera": _mat4_to_column_major_list(w2c),
                 "depth": depth_rel,
             }
@@ -515,10 +554,11 @@ def run_calibration(
 
     cameras_payload = {
         "comment": (
-            "v3 posed calibration. Both cameras stay on their input OpenCV RDF "
-            "poses in the shared ARKit world. intrinsicsNetwork is the K used to "
-            "unproject the depth map (s = Z). intrinsicsImage is that K mapped "
-            "back onto the original photo."
+            "Both images were inferred together with their input poses and K. "
+            "cameraToWorld is T_gt_anchor @ T_pred: the model's view-0 pose mapped "
+            "into the shared ARKit world by the first image's input camera. "
+            "intrinsicsNetwork is the K used to unproject the depth map (s = Z). "
+            "intrinsicsImage is that K mapped back onto the original photo."
         ),
         "convention": {
             "frame": "arkitWorld",
@@ -532,7 +572,9 @@ def run_calibration(
             "projection": "s [u, v, 1]^T = K [X, Y, Z]^T with s = Z",
         },
         "source": {
-            "mode": "v3_posed_calibration",
+            "mode": "mapanything_calibrate",
+            "poseMap": "T_gt_anchor @ T_pred",
+            "anchorImage": anchor_name,
             "input": str(input_dir),
             "maxDepthMeters": max_depth,
         },
@@ -551,9 +593,9 @@ def run_calibration(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Calibrate two perspective images with the v3 posed-calibration call "
-            "and save the point cloud, fx/fy/cx/cy, depth scale s=Z, and both "
-            "camera coordinates in one world."
+            "Infer both perspective images together with their poses and K, "
+            "map the predicted cameras into the shared world, and save the "
+            "point cloud, fx/fy/cx/cy, depth s=Z, and both camera coordinates."
         )
     )
     parser.add_argument(
