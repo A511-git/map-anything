@@ -2,17 +2,20 @@
 """
 N-view MapAnything reconstruction with an auto mode and a condition mode.
 
-Both modes pass every matched photo and its K. Neither passes depth.
+Neither mode passes depth.
 
   auto       No pose prior. The cloud and cameras are the model's view-0 outputs.
+             With a scene JSON, each photo and its K are passed.
+             With no scene JSON, only the photos are passed and the model predicts K.
   condition  JSON cam-to-world poses are injected, like v3 depth_mode=condition
              injects depth. Exported cameras are
              T_world_i = T_gt_anchor @ inv(T_pred_0) @ T_pred_i.
+             A scene JSON is required.
 
-Images are named {scene_id}_{img_id}.jpg. Each scene has
-{scene_id}_poses_world_opencv_rdf.json. Only images present in the folder
-are used, and each one is paired with that img_id in its scene JSON.
-Images from every scene in the folder are passed together.
+Images are named {scene_id}_{img_id}.jpg when a scene JSON is present. Each scene
+has {scene_id}_poses_world_opencv_rdf.json, and each photo is paired with that
+img_id. Images from every scene in the folder are passed together. Without a
+scene JSON, auto uses every image file in the folder.
 
 Writes pointcloud.ply, cameras.json, and depths/<stem>_depth.npy (s = Z).
 
@@ -95,8 +98,36 @@ def _join_path_args(values: Any) -> str:
     return str(values)
 
 
-def discover_views(input_dir: Path) -> List[Dict[str, Any]]:
-    """Pair each present {sceneId}_{imgId} image with that frame in the scene pose JSON."""
+def _list_images(input_dir: Path) -> List[Path]:
+    images = [
+        path
+        for path in input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+    ]
+    images.sort(key=lambda path: natural_sort_key(path.name))
+    return images
+
+
+def _views_from_images(images: List[Path], input_dir: Path) -> List[Dict[str, Any]]:
+    if len(images) < 2:
+        raise ValueError(
+            f"Expected at least 2 images in {input_dir}, found {len(images)}."
+        )
+    return [
+        {
+            "image_path": image_path,
+            "scene_id": None,
+            "frame_index": None,
+            "pose_json": None,
+            "c2w": None,
+            "intrinsics": None,
+        }
+        for image_path in images
+    ]
+
+
+def discover_views(input_dir: Path, *, require_json: bool) -> List[Dict[str, Any]]:
+    """Pair images with scene JSON frames, or use the images alone when auto has no JSON."""
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input folder not found: {input_dir}")
 
@@ -106,16 +137,17 @@ def discover_views(input_dir: Path) -> List[Dict[str, Any]]:
         if scene_id:
             pose_jsons[scene_id] = path
     if not pose_jsons:
-        raise FileNotFoundError(
-            f"No *{POSE_JSON_SUFFIX} files in {input_dir}"
+        if require_json:
+            raise FileNotFoundError(
+                f"No *{POSE_JSON_SUFFIX} files in {input_dir}"
+            )
+        print(
+            f"No *{POSE_JSON_SUFFIX} files in {input_dir}. "
+            "Auto will pass images only."
         )
+        return _views_from_images(_list_images(input_dir), input_dir)
 
-    images = [
-        path
-        for path in input_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
-    ]
-    images.sort(key=lambda path: natural_sort_key(path.name))
+    images = _list_images(input_dir)
 
     scene_ids_longest_first = sorted(pose_jsons, key=len, reverse=True)
     views: List[Dict[str, Any]] = []
@@ -247,6 +279,21 @@ def preprocess_k_geometry(
     return scale, rescale_offset, int(left), int(top)
 
 
+def preprocess_image_geometry(
+    original_wh: Tuple[int, int],
+    target_wh: Tuple[int, int],
+) -> Tuple[float, np.ndarray, int, int]:
+    """Scale and centered crop that preprocess_inputs applies when no K is given."""
+    original = np.asarray(original_wh, dtype=np.float64)
+    target = np.asarray(target_wh, dtype=np.float64)
+    scale = float(np.max(target / original) + 1e-8)
+    rescaled = np.floor(original * scale).astype(int)
+    rescale_offset = 0.5 * (original * scale - rescaled)
+    left = int(rescaled[0] - int(target[0])) // 2
+    top = int(rescaled[1] - int(target[1])) // 2
+    return scale, rescale_offset, left, top
+
+
 def network_intrinsics_to_original(
     k_network: np.ndarray,
     scale: float,
@@ -372,22 +419,27 @@ def run_calibration(
         raise ValueError(f"mode must be 'auto' or 'condition', got {mode!r}")
     use_pose_prior = mode == "condition"
 
-    views = discover_views(input_dir)
+    views = discover_views(input_dir, require_json=use_pose_prior)
+    passed_intrinsics = all(view["intrinsics"] is not None for view in views)
     print(f"Input: {input_dir}")
     print(f"Mode: {mode}")
     print(f"Paired {len(views)} perspective images:")
     for view in views:
-        center = view["c2w"][:3, 3]
-        k = view["intrinsics"]
-        pose_note = (
-            f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
-            if use_pose_prior
-            else "pose prior off"
-        )
+        if use_pose_prior:
+            center = view["c2w"][:3, 3]
+            pose_note = f"xyz=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+        else:
+            pose_note = "pose prior off"
+        if view["intrinsics"] is None:
+            k_note = "K predicted"
+        else:
+            k = view["intrinsics"]
+            k_note = f"K=({k[0, 0]:.1f}, {k[1, 1]:.1f}, {k[0, 2]:.1f}, {k[1, 2]:.1f})"
+        scene = view["scene_id"] if view["scene_id"] is not None else "-"
+        frame = view["frame_index"] if view["frame_index"] is not None else "-"
         print(
-            f"  {view['image_path'].name}  scene={view['scene_id']}  "
-            f"frame={view['frame_index']}  {pose_note}  "
-            f"K=({k[0, 0]:.1f}, {k[1, 1]:.1f}, {k[0, 2]:.1f}, {k[1, 2]:.1f})"
+            f"  {view['image_path'].name}  scene={scene}  "
+            f"frame={frame}  {pose_note}  {k_note}"
         )
 
     if device is None:
@@ -400,8 +452,11 @@ def run_calibration(
     if use_pose_prior:
         print("[Mode] condition: inject JSON poses, no depth")
         print("[Mode] Export T_gt_anchor @ inv(T_pred_0) @ T_pred")
-    else:
+    elif passed_intrinsics:
         print("[Mode] auto: images and K only, no pose prior")
+        print("[Mode] Export the model's view-0 poses, scale, K, and cloud")
+    else:
+        print("[Mode] auto: images only, no K and no pose prior")
         print("[Mode] Export the model's view-0 poses, scale, K, and cloud")
 
     loaded_images: List[np.ndarray] = []
@@ -421,24 +476,28 @@ def run_calibration(
     for view, rgb in zip(views, loaded_images):
         view_dict: Dict[str, Any] = {
             "img": torch.from_numpy(rgb),
-            "intrinsics": torch.from_numpy(view["intrinsics"].astype(np.float32)),
             "is_metric_scale": torch.tensor([True]),
         }
+        if view["intrinsics"] is not None:
+            view_dict["intrinsics"] = torch.from_numpy(
+                view["intrinsics"].astype(np.float32)
+            )
         if use_pose_prior:
             view_dict["camera_poses"] = torch.from_numpy(view["c2w"].astype(np.float32))
         raw_views.append(view_dict)
     processed_views = preprocess_inputs(raw_views, verbose=False)
 
-    for view, processed in zip(views, processed_views):
-        expected = _input_k_at_network_resolution(
-            view["intrinsics"], view["original_wh"], target_wh
-        )
-        got = processed["intrinsics"][0].detach().cpu().numpy()
-        if not np.allclose(expected, got, atol=1e-2):
-            raise RuntimeError(
-                f"Intrinsics resize for {view['image_path'].name} does not match "
-                "preprocess_inputs. Refusing to scale fx, fy, cx, cy back to the photo."
+    if passed_intrinsics:
+        for view, processed in zip(views, processed_views):
+            expected = _input_k_at_network_resolution(
+                view["intrinsics"], view["original_wh"], target_wh
             )
+            got = processed["intrinsics"][0].detach().cpu().numpy()
+            if not np.allclose(expected, got, atol=1e-2):
+                raise RuntimeError(
+                    f"Intrinsics resize for {view['image_path'].name} does not match "
+                    "preprocess_inputs. Refusing to scale fx, fy, cx, cy back to the photo."
+                )
 
     with torch.inference_mode():
         outputs = model.infer(
@@ -531,9 +590,14 @@ def run_calibration(
                 f"Predicted depth for {view['image_path'].name} is "
                 f"{network_w}x{network_h}, expected network size {target_wh[0]}x{target_wh[1]}."
             )
-        scale, rescale_offset, crop_left, crop_top = preprocess_k_geometry(
-            view["original_wh"], target_wh, view["intrinsics"]
-        )
+        if view["intrinsics"] is not None:
+            scale, rescale_offset, crop_left, crop_top = preprocess_k_geometry(
+                view["original_wh"], target_wh, view["intrinsics"]
+            )
+        else:
+            scale, rescale_offset, crop_left, crop_top = preprocess_image_geometry(
+                view["original_wh"], target_wh
+            )
         k_original = network_intrinsics_to_original(
             k_network, scale, rescale_offset, crop_left, crop_top
         )
@@ -637,8 +701,12 @@ def run_calibration(
             "maxDepthMeters": max_depth,
         }
     else:
+        if passed_intrinsics:
+            auto_inputs = "images and K only. No pose prior."
+        else:
+            auto_inputs = "images only. No K and no pose prior."
         comment = (
-            "auto: images and K only. No pose prior. "
+            f"auto: {auto_inputs} "
             "cameraToWorld is the model's view-0 pose. "
             "metricScale and intrinsics are the model outputs. "
             "intrinsicsNetwork is the K used to unproject the depth map (s = Z). "
@@ -690,7 +758,8 @@ def main() -> None:
         required=True,
         choices=["auto", "condition"],
         help=(
-            "auto = images and K only, export the model's view-0 cameras; "
+            "auto = no pose prior; images and K when a scene JSON is present, "
+            "images only when it is not; export the model's view-0 cameras; "
             "condition = inject JSON poses, export T_gt_anchor @ inv(T_pred_0) @ T_pred"
         ),
     )
@@ -700,8 +769,9 @@ def main() -> None:
         nargs="+",
         required=True,
         help=(
-            "Folder with {scene_id}_{img_id} images and each scene's "
-            "*_poses_world_opencv_rdf.json. At least two matched images."
+            "Folder of images. auto can run with only the images. "
+            "condition needs {scene_id}_{img_id} images and each scene's "
+            "*_poses_world_opencv_rdf.json. At least two images."
         ),
     )
     parser.add_argument(
