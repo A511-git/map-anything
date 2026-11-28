@@ -11,7 +11,8 @@ Both modes pass every matched photo and its K. Neither passes depth.
 
 Images are named {scene_id}_{img_id}.jpg. Each scene has
 {scene_id}_poses_world_opencv_rdf.json. Only images present in the folder
-are used, and each one is paired with that img_id in the scene JSON.
+are used, and each one is paired with that img_id in its scene JSON.
+Images from every scene in the folder are passed together.
 
 Writes pointcloud.ply, cameras.json, and depths/<stem>_depth.npy (s = Z).
 
@@ -168,12 +169,6 @@ def discover_views(input_dir: Path) -> List[Dict[str, Any]]:
         raise ValueError(
             f"Expected at least 2 perspective images named {{sceneId}}_{{imgId}} "
             f"in {input_dir}, found {len(views)}."
-        )
-    scene_ids = {view["scene_id"] for view in views}
-    if len(scene_ids) != 1:
-        raise ValueError(
-            f"Matched images come from more than one scene: {sorted(scene_ids)}. "
-            "One run must use a single scene."
         )
     return views
 
@@ -685,7 +680,7 @@ def run_calibration(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Reconstruct any number of perspective images from one scene. "
+            "Reconstruct any number of perspective images. "
             "auto uses the model with no pose prior. "
             "condition injects the JSON poses and saves the refined cameras."
         )
@@ -705,7 +700,7 @@ def main() -> None:
         nargs="+",
         required=True,
         help=(
-            "Folder with {scene_id}_{img_id} images and that scene's "
+            "Folder with {scene_id}_{img_id} images and each scene's "
             "*_poses_world_opencv_rdf.json. At least two matched images."
         ),
     )
